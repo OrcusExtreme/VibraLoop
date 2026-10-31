@@ -1,0 +1,71 @@
+{
+ "mode": "legacy",
+ "config": {
+  "lof_quantile": 0.999,
+  "level_quantile": 0.999,
+  "lof_neighbors": 20,
+  "min_training_windows": 30,
+  "decision_mode": "k_of_n",
+  "k": 4,
+  "n": 4,
+  "cusum_drift": 0.0,
+  "cusum_threshold": 1.2,
+  "release_level": 0.8,
+  "release_windows": 4,
+  "baseline_windows": 8,
+  "self_ratio": 3.0,
+  "condition_z": 3.0,
+  "nonharmonic_ratio_thr": 0.6,
+  "chatter_prominence_min": 8.0,
+  "gate_depth_mm": 0.05,
+  "transient_sec": 0.75,
+  "mitigation_enabled": true,
+  "mitigation_wait_sec": 4.0,
+  "rework_min_passes": 2,
+  "status_emit_interval": 0.5
+ },
+ "feature_config": {
+  "window_sec": 1.0,
+  "hop_sec": 0.25,
+  "min_fill": 0.6,
+  "max_gap_sec": 0.25,
+  "idle_rms_g": 0.02,
+  "accel_range_g": 2.0,
+  "spectral_min_fs": 400.0,
+  "harmonic_halfwidth_hz": 3.0,
+  "min_chatter_hz": 20.0
+ },
+ "normal": {
+  "files": 19,
+  "false_alarms": 1,
+  "cut_minutes": 9.0,
+  "false_alarms_per_hour": 6.67,
+  "per_file": {
+   "센서_데이터_2025-05-31T17-04-14.csv": 0,
+   "센서_데이터_2025-06-05_12-54-48.csv": 0,
+   "센서_데이터_2025-06-05_12-57-08.csv": 0,
+   "센서_데이터_2025-06-05_13-15-52.csv": 0,
+   "센서_데이터_2025-06-05_13-17-52(중간 조금 끊김).csv": 0,
+   "센서_데이터_2025-06-05_13-23-07.csv": 0,
+   "센서_데이터_2025-06-05_13-29-57.csv": 0,
+   "센서_데이터_2025-06-05_13-35-40.csv": 0,
+   "센서_데이터_2025-06-06_17-11-23.csv": 0,
+   "센서_데이터_2025-06-06_17-14-19.csv": 0,
+   "센서_데이터_2025-06-06_17-16-29.csv": 0,
+   "센서_데이터_2025-06-06_17-27-52.csv": 0,
+   "센서_데이터_2025-06-06_17-30-06.csv": 0,
+   "센서_데이터_2025-06-06_17-31-42.csv": 1,
+   "센서_데이터_2025-06-06_17-39-40.csv": 0,
+   "센서_데이터_2025-06-06_17-40-57.csv": 0,
+   "센서_데이터_2025-06-06_17-44-28.csv": 0,
+   "센서_데이터_2025-06-06_17-45-52.csv": 0,
+   "센서_데이터_2025-06-06_17-47-36.csv": 0
+  }
+ },
+ "abnormal": {
+  "센서_데이터_2025-06-01_18-21-20_S24000_0.5_이상.csv": {
+   "alarms": 3,
+   "windows": 74
+  }
+ }
+}

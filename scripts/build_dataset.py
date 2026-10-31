@@ -5,6 +5,7 @@
   windows.csv     윈도우(1초, 0.25초 간격)마다 특징값·절삭 조건·판정 구간 여부·라벨
                   특징은 실시간 감지와 같은 src/features.py로 계산합니다.
   runs.csv        실행마다 대표 조건(판정 구간의 중앙값)과 채터 윈도우 비율
+  labels.csv      라벨 구간 원본 (실행, 라벨, 시작·끝 서버 시각) → evaluate_detector.py가 감지 지연을 구간 시작부터 잼
   ramp_limits.csv 경사 절입 시험(run_type=ramp)에서 채터가 처음 나타난 깊이 = 회전수별 안정 한계 추정값
                   → scripts/make_experiment_nc.py grid --limits 에 넣어 본 실험 깊이를 정합니다.
 판정 구간: 가공 중(State=running), GRBL Run, Z ≤ -gate_depth, 스핀들 회전 (실시간 감지와 같은 규칙).
@@ -26,6 +27,7 @@ from data_recorder import read_manifest  # noqa: E402
 from vibration_monitor import DETECTION_DEFAULTS  # noqa: E402
 
 LABEL_PRIORITY = ['chatter', 'transition', 'air']
+LABEL_COLUMNS = ['run_id', 'run_type', 'label', 'start', 'end', 'start_x', 'end_x', 'note']
 FEATURE_COLUMNS = (features.TIME_FEATURE_NAMES
                    + ['rms', 'saturation', 'fs', 'spectral', 'nonharmonic_ratio', 'peak_freq', 'peak_prominence',
                       'spectral_entropy'])
@@ -142,7 +144,7 @@ def main():
     if not runs:
         sys.exit(f"{args.raw}/manifest.csv가 없습니다. 화면의 '데이터 수집'으로 먼저 기록하세요.")
     config = dict(DETECTION_DEFAULTS, **features.DEFAULT_FEATURE_CONFIG)
-    all_rows, run_rows, ramp_rows = [], [], []
+    all_rows, run_rows, ramp_rows, label_rows = [], [], [], []
     for run in runs:
         try:
             rows, timing = build_run(args.raw, run, config, args.overlap)
@@ -150,6 +152,8 @@ def main():
             print(f"  [건너뜀] {run['run_id']}: {e}")
             continue
         all_rows.extend(rows)
+        label_rows.extend(dict({key: seg.get(key) for key in LABEL_COLUMNS[2:]}, run_id=run['run_id'],
+                               run_type=run.get('run_type', '')) for seg in run['labels'])
         cut = [r for r in rows if r['gate'] and not r['transient'] and r['label'] in ('stable', 'chatter', 'transition')]
         chatter = [r for r in cut if r['label'] == 'chatter']
         summary = {'run_id': run['run_id'], 'run_type': run.get('run_type', ''), 'timing': timing,
@@ -171,6 +175,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     pd.DataFrame(all_rows).to_csv(os.path.join(args.out, 'windows.csv'), index=False, encoding='utf-8-sig')
     pd.DataFrame(run_rows).to_csv(os.path.join(args.out, 'runs.csv'), index=False, encoding='utf-8-sig')
+    pd.DataFrame(label_rows, columns=LABEL_COLUMNS).to_csv(os.path.join(args.out, 'labels.csv'), index=False,
+                                                           encoding='utf-8-sig', float_format='%.6f')
     if ramp_rows:
         with open(os.path.join(args.out, 'ramp_limits.csv'), 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.DictWriter(f, fieldnames=list(ramp_rows[0]))

@@ -2,7 +2,7 @@
 
 GRBL(v1.1) 기반 CNC 밀링 머신과 스핀들에 장착된 3축 가속도 센서(MPU6050)를 연동하여, 웹 대시보드에서 가공 경로와 장비 상태를 실시간 모니터링 및 제어하고, 가공 중 발생하는 **이상 진동(채터, Chatter)을 실시간으로 감지하여 오버라이드로 회전수·이송을 즉시 조정(온라인 대응) → 계속되면 위치를 유지한 채 정지 → 절삭 조건 제안 → 깊이를 나눈 재가공 NC 코드 자동 생성 → 자율 재가공**을 수행하는 스마트 제조 자율제어 시스템입니다. 실험용 NC 생성, 데이터 수집 기록, 데이터셋·모델 학습·평가 도구를 함께 제공합니다.
 
-> 감지·최적화 알고리즘의 설계 근거와 데이터 수집 계획은 [edit_analysis.md](edit_analysis.md), 변경 이력은 [edit_log.md](edit_log.md)를 참고하세요.
+> 감지·최적화 알고리즘의 설계 근거와 데이터 수집 계획은 [edit_analysis.md](edit_analysis.md), `cnc_edit_guide1031.md` 제안서 적용 분석과 단계별 개편 계획(P01–P13)은 [edit_analysis2.md](edit_analysis2.md), 변경 이력은 [edit_log.md](edit_log.md)를 참고하세요.
 
 ---
 
@@ -119,6 +119,7 @@ ProjectLab_System/
 ├── README.md                   # [문서] 시스템 종합 가이드 및 사용자 매뉴얼
 ├── edit_log.md                 # [문서] 수정 이력 (최신 항목이 위)
 ├── edit_analysis.md            # [문서] 감지·최적화 알고리즘 분석과 데이터 수집 계획 (2026-10-31, 현재 설계의 근거)
+├── edit_analysis2.md           # [문서] cnc_edit_guide1031.md 적용 분석과 개편 단계 P01–P13, 진행 현황
 ├── .gitignore                  # [Git] 버전 관리 제외 규칙 (가상환경, 임시 로그 등)
 ├── .gitattributes              # [Git] .bat은 CRLF, .sh는 LF 줄바꿈 유지
 ├── .venv/                      # (Git 제외) setup이 PC마다 새로 만드는 가상환경 — 다른 PC로 복사하지 않음
@@ -146,6 +147,7 @@ ProjectLab_System/
 │   ├── 학습 데이터/            # 이상 진동 감지 모델 학습용 센서 CSV (정상 19개 + 파일명에 '이상'이 들어간 1개는 학습 제외)
 │   ├── raw/                    # (Git 제외) 데이터 수집 기록: <run_id>_sensor.csv, <run_id>_machine.csv, manifest.csv
 │   ├── dataset/                # (Git 제외) scripts/build_dataset.py가 만든 학습·평가용 데이터셋
+│   ├── synthetic/              # (Git 제외) scripts/make_synthetic_runs.py가 만든 합성 기록과 데이터셋
 │   └── detector_settings.json  # (Git 제외) 모델 관리 창에서 바꾼 감지 설정 (온라인 대응, 판정 방식)
 │
 ├── nc/                         # [NC G-code 파일]
@@ -181,10 +183,20 @@ ProjectLab_System/
 │   ├── setup_env.py            # setup.bat / setup.sh가 실행하는 설치 스크립트 (.venv 생성·검사, 패키지 설치)
 │   ├── check_env.py            # 실행 환경 점검 (Python·패키지 버전, 모델 로드, 학습 데이터, 웹 리소스)
 │   ├── make_experiment_nc.py   # 데이터 수집 실험용 NC 생성 (경사 절입 시험, 조건 조합, 공회전)
-│   ├── build_dataset.py        # data/raw → data/dataset (윈도우 특징·조건·판정 구간·라벨)
+│   ├── build_dataset.py        # data/raw → data/dataset (윈도우 특징·조건·판정 구간·라벨, 라벨 구간 원본)
 │   ├── train_models.py         # 데이터셋 → 채터 확률 모델·조건 모델 (실행 단위 교차 검증)
-│   ├── evaluate_detector.py    # 감지기 교차 검증 (감지율, 감지 지연, 시간당 오경보)
+│   ├── evaluate_detector.py    # 감지기 교차 검증 (감지율, 라벨 시작부터의 감지 지연, 시간당 오경보, JSON 저장·비교)
+│   ├── make_synthetic_runs.py  # 정답을 아는 합성 가공 기록 (정상·급성장/완만한 채터·충격·공구 진입, 1 kHz 앨리어싱 재현)
 │   └── test_arduino_sensor.py  # 센서 모듈 시뮬레이션 및 포트 연결 테스트 스크립트
+│
+├── tests/                      # [테스트] run_tests.py로 실행 (프로젝트 임시 복사본에서, 사용법: tests/README.md)
+│   ├── run_tests.py            # 실행기 (unit, ui, e2e, bench)
+│   ├── unit_checks.py          # 특징·판정·최적화·재가공·데이터 수집·스크립트·평가 기반
+│   ├── e2e_checks.py           # GRBL 시뮬레이터로 cnc_app 전체 흐름 (스트리밍, 정지, 온라인 대응, 재가공)
+│   ├── grbl_sim.py             # GRBL 1.1 시리얼 시뮬레이터
+│   ├── ui_*_checks.js          # static/script.js 화면 로직 (Node.js)
+│   ├── bench_checks.py         # 합성·예전 데이터 감지기 벤치마크 (기준값과 비교)
+│   └── baseline/               # 벤치마크 기준값 (v1.1)
 │
 ├── docs/                       # [상세 기술 문서]
 │   └── README_ARDUINO.md       # 아두이노 배선도, 라이브러리 설치 및 센서 연동 매뉴얼
@@ -432,14 +444,26 @@ DetectedAt,X,Y,Z,SpindleRPM,FeedRate,SpindleOverride,FeedOverride,Evidence,Chatt
 4. **데이터셋·학습·평가**:
 
    ```bash
-   .venv\Scripts\python.exe scripts\build_dataset.py      # data/dataset/ (windows.csv, runs.csv, ramp_limits.csv)
+   .venv\Scripts\python.exe scripts\build_dataset.py      # data/dataset/ (windows.csv, runs.csv, labels.csv, ramp_limits.csv)
    .venv\Scripts\python.exe scripts\train_models.py       # models/stability_model.joblib, condition_model.joblib
    .venv\Scripts\python.exe scripts\evaluate_detector.py  # 실행 단위 교차 검증: 감지율, 감지 지연, 시간당 오경보
    ```
 
    - `train_models.py`는 실행 단위 교차 검증 결과와, '안전'으로 본 조건에서 실제 채터가 난 비율을 보여줍니다. 데이터가 적으면 채터 확률이 5% 미만인 조건이 없어 경고가 나오며, 그동안은 기본 규칙을 씁니다.
    - `evaluate_detector.py --set k=3 --set self_ratio=2.5`처럼 판정 설정을 바꿔 비교한 뒤 `src/vibration_monitor.py`의 `DETECTION_DEFAULTS`를 고칩니다. `--legacy`는 예전 `data/학습 데이터`로 평가합니다.
+   - `--json 결과.json`으로 결과를 저장하고, `--compare 결과.json`으로 나중 결과와 나란히 비교합니다. 감지 지연은 라벨 구간 시작 시각부터 잽니다.
    - 새 모델은 서버를 다시 시작하면 적용됩니다.
+
+### 5.6 테스트와 벤치마크
+
+코드를 고친 뒤에는 테스트를 돌립니다. 장비 없이 동작하며, 프로젝트를 임시 폴더에 복사해 실행하므로 저장소 파일은 바뀌지 않습니다. 자세한 내용은 [tests/README.md](tests/README.md)에 있습니다.
+
+```bash
+.venv\Scripts\python.exe tests\run_tests.py         # 단위·화면·종단 간 테스트 (약 3분, 화면 테스트는 Node.js 필요)
+.venv\Scripts\python.exe tests\run_tests.py bench   # 감지기 벤치마크: 합성 시나리오·예전 데이터 → v1.1 기준값과 비교
+```
+
+벤치마크의 합성 기록은 `scripts/make_synthetic_runs.py`가 고정 시드로 만듭니다. 정상, 급성장·완만한 채터, 짧은 충격, 공구 진입 시나리오로 구성되며, 채터 시작 시각을 정확히 알기 때문에 감지 지연을 수정 전후로 비교할 수 있습니다.
 
 ---
 
@@ -459,6 +483,21 @@ DetectedAt,X,Y,Z,SpindleRPM,FeedRate,SpindleOverride,FeedOverride,Evidence,Chatt
 ---
 
 ## 7. 버전 이력 및 진행 사항
+
+### 📌 v1.1.1 주요 개선 내역 (2026-10-31) — 테스트 자동화 및 평가 기반(P01) 구축
+
+제안서([`cnc_edit_guide1031.md`](cnc_edit_guide1031.md)) 기반 개편 분석 및 단계별 진행 계획은 [`edit_analysis2.md`](edit_analysis2.md), 세부 변경 이력은 [`edit_log.md`](edit_log.md)에 정리되어 있습니다.
+
+- **테스트 스위트 저장소화 ([`tests/`](tests/))**:
+  - 단위/통합 테스트(`unit_checks.py`), GRBL 시뮬레이터 연동 E2E 테스트(`e2e_checks.py`, `grbl_sim.py`), 화면 로직 테스트(`ui_events_checks.js`, `ui_vibration_checks.js`)를 통합 실행하는 `tests/run_tests.py` 구축.
+  - 실제 장비 없이도 임시 격리 디렉토리에서 자동 복사·검증 후 복구하는 무결성 테스트 실행 환경 제공.
+- **합성 가공 기록 생성기 ([`scripts/make_synthetic_runs.py`](scripts/make_synthetic_runs.py))**:
+  - 실제 데이터 수집 포맷과 동일한 정답 라벨이 보장된 합성 데이터 생성 (정상 절삭, 급격한/완만한 채터, 순간 충격 노이즈, 공구 진입 시나리오).
+- **라벨 기준 벤치마크 및 검증 체계 고도화 ([`scripts/build_dataset.py`](scripts/build_dataset.py), [`scripts/evaluate_detector.py`](scripts/evaluate_detector.py))**:
+  - `labels.csv` 기반 정밀 시간 구간 매핑, 라벨 시작 시점 기준 감지 지연 측정, 실행 종류별(ramp/grid/air/synthetic) 분리 집계.
+  - v1.1 알고리즘 기준값(합성 시나리오 감지 10/10, 지연 중앙값 1.27초, 정상 가공 8.1분간 오경보 1회) 고정 및 비교 기능(`--compare`) 제공.
+- **P01 완료 및 향후 개편 로드맵 수립**:
+  - 향후 P03(앨리어싱 마스킹), P04~P06(단주기 윈도우, 롤링 베이스라인, 2단계 판정), P11(안정성 한계도 SLD 교체) 진행 기반 마련.
 
 ### 📌 v1.1 주요 개선 내역 (2026-10-31) — 이상 진동 감지·온라인 제어 재설계 및 데이터 수집 파이프라인
 

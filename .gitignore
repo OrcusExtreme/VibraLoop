@@ -19,6 +19,8 @@ data/*.old
 # Data collection recordings and derived datasets (large; back them up outside Git)
 data/raw/
 data/dataset/
+# Synthetic runs from scripts/make_synthetic_runs.py (regenerated from a seed)
+data/synthetic/
 # Per-PC detector settings saved from the model window
 data/detector_settings.json
 
