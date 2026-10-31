@@ -60,7 +60,8 @@ const $ = (id) => document.getElementById(id);
 const trained = { is_trained: true, is_training: false, training_dir: 'data/학습 데이터', files: ['a.csv', 'b.csv'], samples: 123456,
     windows: 4567, thresholds: { rms_g: 0.65, lof: 3.49, calibration: 'session_holdout' },
     settings: { mitigation_enabled: true, decision_mode: 'k_of_n' }, optimizer: { model: false }, condition_model: false,
-    sensor: { device: 'MPU6050', fs: 1000, range_g: 8 } };
+    sensor: { device: 'MPU6050', fs: 1000, range_g: 8 },
+    window: { profile: 'legacy', label: '1초 창·0.25초 간격', stream_profile: 'fast', fallback: true, window_sec: 1.0, hop_sec: 0.25 } };
 
 (async () => {
     // startup: server still training -> 'loading' then retry -> trained
@@ -80,6 +81,9 @@ const trained = { is_trained: true, is_training: false, training_dir: 'data/학�
     check('detail lists counts, thresholds, condition source and sensor', $('vibration-model-status').textContent.includes('샘플 123,456개') &&
           $('vibration-model-status').textContent.includes('0.650 g') && $('vibration-model-status').textContent.includes('기본 규칙') &&
           $('vibration-model-status').textContent.includes('1000 Hz'), $('vibration-model-status').textContent);
+    check('window setting in use shown, with a note when the sensor has no model of its own window setting',
+          $('vibration-model-status').textContent.includes('판정 창: 1초 창·0.25초 간격') &&
+          $('vibration-model-status').textContent.includes('학습 데이터가 없어'), $('vibration-model-status').textContent);
     check('settings controls reflect the server', $('mitigation-enabled').checked === true && $('decision-mode').value === 'k_of_n');
     check('file list rendered as text', $('vibration-model-files').textContent === 'a.csv\nb.csv');
 

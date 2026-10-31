@@ -27,7 +27,7 @@ flowchart TB
     end
 
     subgraph Intelligence ["Chatter Detection & Autonomous Rework Engine"]
-        Feat["Feature Extraction (src/features.py)\n- 1.0s time-based window, 0.25s step\n- DC/gravity removal: AC RMS, kurtosis, crest factor\n- Non-harmonic energy ratio & chatter frequency (>400 Hz)"]
+        Feat["Feature Extraction (src/features.py)\n- 0.2s window / 50ms step (1 kHz) or 1.0s / 0.25s (legacy)\n- DC/gravity removal: AC RMS, kurtosis, crest factor\n- Alias-aware non-harmonic energy ratio & chatter peak (>400 Hz)"]
         VMon["Chatter Monitor (src/vibration_monitor.py)\n- Gating: Run state, in-material (Z <= -0.05 mm), spindle on\n- Evidence metrics: LOF score, level, cut baseline, condition model\n- 4-consecutive (1s) or CUSUM alarm trigger\n- Online override mitigation -> safe stop escalation"]
         Opt["Cutting Condition Optimizer (src/optimizer.py)\n- Chatter probability model (models/stability_model.joblib)\n- Tooth passing frequency avoidance (n = 60 * f_c / (Z * k))\n- Fallback heuristics (spindle +10%, feed -20%, 2 depth passes)"]
         Rework["Rework Code Generator (src/rework.py)\n- Substitute optimized S/F, multi-pass depth splitting\n- Final finish pass with tolerance (Z - tol)\n- Safe Z5 entry and retract clearance"]
@@ -127,7 +127,7 @@ ProjectLab_System/
 │
 ├── src/                        # [Backend Core Modules]
 │   ├── routes.py               # REST API endpoints and Socket.IO bidirectional event handlers
-│   ├── features.py             # Feature computation (1s window, DC removal, AC RMS, kurtosis, spectral)
+│   ├── features.py             # Feature computation (window by sensor rate, DC removal, AC RMS, kurtosis, spectral)
 │   ├── vibration_monitor.py    # Chatter monitor (gating, multi-evidence scoring, online mitigation, safe stop)
 │   ├── optimizer.py            # Cutting condition proposal (stability model -> chatter frequency -> fallback)
 │   ├── rework.py               # Rework G-code generator (depth-split passes + tolerance finish, safe Z5 height)
@@ -225,13 +225,28 @@ ProjectLab_System/
 - Accurately computes true 3D toolpath lengths and helical arc distances for arc interpolation (`G2`/`G3`) with center offsets (`I`, `J`, `K`) or radius (`R`).
 
 ### 3.3 Real-Time Chatter Detection ([`src/vibration_monitor.py`](src/vibration_monitor.py), [`src/features.py`](src/features.py))
-- **Unified Feature Extraction**: Operates on a time-based 1.0-second sliding window evaluated every 0.25 seconds.
+- **Unified Feature Extraction**: Operates on time-based sliding windows chosen from the sensor sampling rate.
+  - **Fast sensors (≥ 400 Hz, 1 kHz firmware):** 0.2-second windows evaluated every 50 ms, plus the energy of the newest non-overlapping 50 ms block.
+  - **Legacy sensors (~100 Hz):** 1.0-second windows evaluated every 0.25 seconds.
+  - Detector models are trained per window setting. If the connected sensor has no model of its own setting, the other model is used and the model window says so.
+  - Live evaluation uses the same time grid as offline dataset building.
   - Per-window mean removal eliminates DC gravity and sensor mounting orientation biases.
   - Calculates AC RMS, kurtosis, and crest factor per axis without destructive smoothing.
   - For sampling rates $\ge 400\text{ Hz}$ (fast firmware), computes the non-harmonic energy ratio (energy excluding spindle rotational harmonics) and identifies dominant chatter peak candidates ($f_c$).
+  - **Alias-aware harmonic masking**: At 1 kHz the tooth-passing frequency (533–800 Hz for 2 flutes at 16,000–24,000 rpm) lies above the 500 Hz Nyquist limit and folds back into the band. Rotational harmonics up to the 8th order are therefore masked at their folded positions $|k f_{rot} - m f_s|$.
+  - **Rotation frequency from the spectrum**: The actual rotation frequency is re-estimated within ±5% of the commanded speed. The estimate is the candidate whose 1st–4th harmonics (at their folded positions) jointly carry the most energy, so a single large chatter peak cannot capture it. This also compensates spindle-speed and sampling-rate errors.
+  - **Masked-band limit**: If the masks cover more than half of the band, the non-harmonic ratio is not computed.
 - **Gating Rules**: Detection is active only when all conditions hold: state is `running`, GRBL status is `Run`, tool is in-material ($Z \le -0.05\text{ mm}$), and spindle is rotating. A 0.75-second transient filter is applied following entry into material or parameter override changes.
 - **Multi-Evidence Metric**: The anomaly score is computed as $\max(\text{LOF score}, \text{vibration level}, \text{cut baseline ratio}, \text{condition model z-score}, \text{spectral peak})$.
+- **Rolling Baseline**: The cut-baseline ratio uses the larger of two baselines:
+  - **Cut-start baseline:** the first 2 seconds of the cut.
+  - **Rolling baseline:** the median RMS of normal-looking windows in the 2 seconds before the current window, excluding windows that overlap it.
+  - Legitimate load increases (wider engagement) are followed by the rolling part. Returning to normal cutting after a quiet stretch is not mistaken for a jump, because the cut-start part covers it.
+  - The rolling part freezes while an alarm is active or once any evidence term reaches the release level (0.8), so slowly growing chatter is not absorbed.
+  - It is rebuilt after a speed or feed change, but only when no alarm is active. During online mitigation it is kept, so recovery is judged against the pre-chatter level.
 - **Decision Logic**: Triggers when the composite evidence exceeds threshold for 4 consecutive windows (1.0 second), or via cumulative sum (CUSUM) mode. Recovery requires 4 consecutive windows below 0.8.
+  - The counts are defined at the 0.25 s step. On the 50 ms grid they are rescaled to keep the same duration: 16 of 16 windows, 2 s baseline.
+  - A single impulse spanning a few overlapping 0.2 s windows therefore cannot trigger an alarm.
 
 ### 3.4 Chatter Mitigation & Cutting Condition Proposal ([`src/optimizer.py`](src/optimizer.py))
 - **Stage 1 Online Mitigation**: Upon chatter confirmation, real-time GRBL override commands immediately adjust spindle speed and feed rate (default: RPM +10%, Feed -20%). If vibration subsides within 4.0 seconds, machining proceeds. Limited to once per cutting pass.
@@ -240,6 +255,8 @@ ProjectLab_System/
   2. **Chatter Frequency Avoidance**: Computes tooth passing frequency synchronization:
      $$n = \frac{60 \cdot f_c}{Z \cdot k}$$
      selecting the closest attainable spindle speed without exceeding feed-per-tooth limits.
+     - Used only when the sensor sampling rate exceeds twice the tooth-passing frequency.
+     - With the 1 kHz sensor the measured chatter peak can be an alias of a higher frequency, so this rule is skipped and the reason is logged.
   3. **Fallback Heuristics**: Preserves spindle speed, decreases feed rate by 20%, and splits cutting depth into 2 passes.
 
 ### 3.5 Safe Rework G-code Auto-Generation ([`src/rework.py`](src/rework.py))
@@ -410,6 +427,11 @@ Run automated verification tests without physical hardware:
 .venv\Scripts\python.exe tests\run_tests.py bench
 ```
 
+The benchmark evaluates two synthetic sets and the legacy data against the v1.1 baselines in [`tests/baseline/`](tests/baseline/):
+
+- **Default set:** 28 runs, DLPF 184 Hz.
+- **Stress set:** the same runs with DLPF 260 Hz and the spindle turning 2% faster than commanded.
+
 ---
 
 ## 6. Safety Interlocks & Policies
@@ -424,6 +446,26 @@ Run automated verification tests without physical hardware:
 ---
 
 ## 7. Version History & Changelog
+
+### 📌 v1.1.2 (2026-10-31) — Alias-Aware Spectrum (P03), Per-Sensor Windows (P04) & Rolling Baseline (P05)
+
+- **Rolling Baseline ([`src/vibration_monitor.py`](src/vibration_monitor.py), P05)**:
+  - The cut-baseline ratio now utilizes $\max(\text{cut-start baseline}, \text{rolling 2s baseline})$ over normal, non-overlapping windows.
+  - Automatically freezes during active alarms and whenever any evidence metric reaches 0.8.
+  - Rebuilt upon in-cut speed/feed changes only when no alarm is active, ensuring online mitigation is evaluated against the pre-chatter baseline.
+  - Legacy-data normal false alarms dropped from 1 (v1.1) to 0, while abnormal file alarms remain stable at 3.
+- **Per-Sensor Window Profiles & Real-Time Grid ([`src/features.py`](src/features.py), [`src/vibration_monitor.py`](src/vibration_monitor.py), P04)**:
+  - High-speed sensors ($\ge 400\text{ Hz}$) adopt the `fast` profile (0.2s window, 50ms step, plus newest 50ms block energy), reducing abrupt chatter latency from 1.25s to 0.90s.
+  - Legacy sensors preserve the 1.0s window / 0.25s step `legacy` profile.
+  - Separate models trained and selected dynamically by sampling rate; decision counts rescaled to maintain equivalent time windows on the 50ms grid.
+  - Per-window evaluation overhead benchmarked at 1.45ms (well within the 50ms real-time budget).
+- **Alias-Aware Spectral Features & Spindle Tracking ([`src/features.py`](src/features.py), [`src/optimizer.py`](src/optimizer.py), P03)**:
+  - Spindle harmonics up to the 8th order are masked where they fold under 1 kHz aliasing.
+  - Spectral rotation frequency estimation (`estimate_rotation_hz`) corrects for spindle tachometer offsets and sampling jitter.
+  - Guarded chatter-frequency optimization to execute only when sampling rate exceeds twice the tooth passing frequency.
+  - Benchmark stress set ([`tests/bench_checks.py`](tests/bench_checks.py), `make_synthetic_runs.py --rpm-error`) added with fixed baseline ([`tests/baseline/v1.1_stress.json`](tests/baseline/v1.1_stress.json)).
+- **Test Suite Expansion**:
+  - Unit test suite expanded from 75 to 100 passing tests ([`tests/unit_checks.py`](tests/unit_checks.py)).
 
 ### 📌 v1.1.1 (2026-10-31) — Automated Test Suite & Evaluation Foundation (P01)
 - **Repository Test Suite Integration ([`tests/`](tests/))**: Comprehensive unit/integration tests ([`unit_checks.py`](tests/unit_checks.py), 75/75 passing), E2E test with simulated serial GRBL ([`e2e_checks.py`](tests/e2e_checks.py), [`grbl_sim.py`](tests/grbl_sim.py)), and headless UI logic tests ([`ui_events_checks.js`](tests/ui_events_checks.js)).

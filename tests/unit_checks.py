@@ -87,6 +87,68 @@ text = "DeviceTime,AccX,AccY,AccZ\n" + "".join(f"{i / 1000:.3f},0,1,0\n" for i i
 loaded = features.load_sensor_csv(text)
 check("device time reset splits segments", loaded['timing'] == 'device' and len(loaded['segments']) == 2)
 
+print("== alias masking and rotation estimate (P03) ==")
+from scipy import signal as sps  # noqa: E402
+
+
+def sensor_signal(rpm, tone=None, rpm_error=0.0, fs_error=0.0, dlpf=260.0, seconds=1.0, seed=0):
+    """1 kHz sensor output of spindle harmonics 1-6 made at 8 kHz -> DLPF -> decimation (folded like the real sensor).
+    tone: optional (Hz, amplitude) non-harmonic component. rpm_error: spindle runs faster than commanded.
+    fs_error: the device reports a sampling rate that is off by this fraction (timestamps use the reported rate)."""
+    r = np.random.default_rng(seed)
+    t8 = np.arange(int(seconds * 8000)) / 8000.0
+    f_rot = rpm * (1 + rpm_error) / 60.0
+    x = np.zeros((len(t8), 3))
+    for k, amp in ((1, 0.10), (2, 0.15), (3, 0.04), (4, 0.06), (5, 0.02), (6, 0.03)):
+        for axis, gain in enumerate((1.0, 0.6, 0.3)):
+            x[:, axis] += amp * gain * np.sin(2 * np.pi * k * f_rot * t8 + r.uniform(0, 2 * np.pi))
+    if tone:
+        x += tone[1] * np.sin(2 * np.pi * tone[0] * t8)[:, None] * [1.0, 0.8, 0.5]
+    b, a = sps.butter(2, dlpf, fs=8000.0)
+    y = sps.lfilter(b, a, x, axis=0)[::8] + r.normal(0, 0.004, (len(t8) // 8, 3))
+    return y, np.arange(len(y)) / (1000.0 * (1 + fs_error))
+
+
+cfg8 = features.feature_config({'accel_range_g': 8.0})
+worst, wrong_rotation = [], []
+for rpm in (16000, 18000, 20000, 24000):
+    for rpm_err, fs_err in ((0.0, 0.0), (0.02, 0.0), (-0.02, 0.0), (0.0, 0.02)):
+        y, ty = sensor_signal(rpm, rpm_error=rpm_err, fs_error=fs_err, seed=rpm)
+        f = features.compute_features(y, ty, cfg8, spindle_rpm=rpm)
+        worst.append((f.get('nonharmonic_ratio', 1.0), rpm, rpm_err, fs_err))
+        apparent = rpm * (1 + rpm_err) / 60.0 * (1 + fs_err)  # what the spectrum shows with the reported fs
+        if f.get('rotation_source') != 'spectrum' or abs(f['rotation_hz'] - apparent) > 1.0:
+            wrong_rotation.append((rpm, rpm_err, fs_err, f.get('rotation_hz'), round(apparent, 1)))
+check("harmonics only (folded tooth passing, DLPF 260 Hz): non-harmonic ratio stays low at 16000-24000 rpm, "
+      "also with 2% spindle-speed or sampling-rate error", max(worst)[0] < 0.2, f"worst {max(worst)}")
+check("rotation frequency recovered from the spectrum (within 1 Hz of what the sensor shows)", not wrong_rotation,
+      str(wrong_rotation))
+y, ty = sensor_signal(18000, rpm_error=0.02)
+legacy_cfg = dict(cfg8, harmonic_orders=1, rotation_search_pct=0.0)  # v1.1: commanded speed, 1st order only
+legacy_ratio = features.compute_features(y, ty, legacy_cfg, spindle_rpm=18000)['nonharmonic_ratio']
+check("v1.1 masking (commanded speed, no folded orders) would have flagged the same signal", legacy_ratio > 0.6,
+      f"v1.1-style ratio {legacy_ratio:.2f}")
+missed = []
+for rpm, tone_hz in ((16000, 230.0), (18000, 250.0), (20000, 180.0), (24000, 300.0)):
+    y, ty = sensor_signal(rpm, tone=(tone_hz, 0.3), rpm_error=0.02, seed=rpm + 1)
+    f = features.compute_features(y, ty, cfg8, spindle_rpm=rpm)
+    if not (f.get('nonharmonic_ratio', 0) > 0.6 and abs(f.get('peak_freq', 0) - tone_hz) <= 2.0):
+        missed.append((rpm, tone_hz, f.get('nonharmonic_ratio'), f.get('peak_freq')))
+check("non-harmonic tone (chatter) still found: ratio > 0.6 and peak at the tone", not missed, str(missed))
+y, ty = sensor_signal(18000, tone=(311.0, 0.5), seed=7)
+f = features.compute_features(y, ty, cfg8, spindle_rpm=18000)
+check("a strong tone 11 Hz from the 1st order does not capture the rotation estimate (several orders must agree)",
+      abs(f['rotation_hz'] - 300.0) < 1.0 and abs(f['peak_freq'] - 311.0) <= 2.0 and f['nonharmonic_ratio'] > 0.6,
+      f"rotation {f['rotation_hz']} peak {f.get('peak_freq')} ratio {f.get('nonharmonic_ratio')}")
+noise = np.random.default_rng(3).normal(0, 0.01, (1000, 3))
+f_noise = features.compute_features(noise, np.arange(1000) / 1000.0, cfg8, spindle_rpm=18000)
+f_wide = features.compute_features(*sensor_signal(16000), dict(cfg8, harmonic_orders=40, harmonic_halfwidth_hz=15.0),
+                                   spindle_rpm=16000)
+check("no visible rotation -> commanded speed; mask covering > 50% of the band -> no non-harmonic ratio",
+      f_noise['rotation_source'] == 'command' and f_noise['rotation_hz'] == 300.0
+      and f_wide['masked_fraction'] > 0.5 and 'nonharmonic_ratio' not in f_wide and 'peak_freq' not in f_wide,
+      f"noise {f_noise.get('rotation_source')}, wide mask {f_wide.get('masked_fraction')}")
+
 print("== sensor protocol ==")
 stream = sensor_protocol.SensorStream()
 s, m = stream.parse_line("A,0,0,4096,0", 1.0)
@@ -118,9 +180,15 @@ rew = opt.suggest(20000, 100, 0.3, purpose='rework')
 check("fallback online: spindle +10%, feed -20%", online['method'] == 'fallback' and online['n'] == 22000 and online['F'] == 80)
 check("fallback at the speed limit goes down instead", opt.suggest(23000, 100, purpose='online')['n'] == 20700)
 check("fallback rework: same speed, feed -20%, depth in 2", rew['n'] == 20000 and rew['F'] == 80 and rew['passes'] == 2)
-cf = opt.suggest(20000, 100, 0.3, chatter_freq=1500, flutes=2, purpose='online')
+cf = opt.suggest(20000, 100, 0.3, chatter_freq=1500, flutes=2, purpose='online', sample_rate=4000)
 check("chatter frequency: tooth passing = f_c / k (1500 Hz, 2 flutes -> 22500 rpm), chip load not increased",
       cf['method'] == 'chatter_frequency' and cf['n'] == 22500 and cf['F'] == 100, str(cf))
+cf_1k = opt.suggest(20000, 100, 0.3, chatter_freq=437, flutes=2, purpose='online', sample_rate=1000)
+cf_unknown = opt.suggest(20000, 100, 0.3, chatter_freq=437, flutes=2, purpose='online')
+check("chatter frequency not used when the sensor cannot resolve tooth passing (1 kHz < 2 x 667 Hz) or fs is unknown",
+      cf_1k['method'] == 'fallback' and "접혀" in cf_1k['reason'] and cf_unknown['method'] == 'fallback'
+      and optimizer.chatter_frequency_usable(20000, 2, 1400) and not optimizer.chatter_frequency_usable(20000, 2, 1300),
+      cf_1k['reason'])
 check("unknown conditions -> no suggestion", opt.suggest(None, 100) is None)
 from sklearn.gaussian_process import GaussianProcessClassifier  # noqa: E402
 from sklearn.preprocessing import StandardScaler  # noqa: E402
@@ -428,6 +496,183 @@ ev3 = subprocess.run([py, os.path.join(COPY, "scripts", "evaluate_detector.py"),
                      capture_output=True, text=True, encoding="utf-8")
 check("--compare prints the stored result side by side (same code -> no changed metric)", ev3.returncode == 0
       and "기준과 비교" in ev3.stdout and "  *" not in ev3.stdout.split("기준과 비교")[1], ev3.stdout[-300:])
+
+print("== window settings per sensor (P04) ==")
+fast_cfg = features.profile_config(cfg8, 'fast')
+check("window setting from the sampling rate: ~90 Hz -> 1 s / 0.25 s, 1 kHz -> 0.2 s / 0.05 s with 50 ms blocks",
+      features.window_profile(90.0) == 'legacy' and features.window_profile(1000.0) == 'fast'
+      and features.window_profile(None) == 'legacy' and (fast_cfg['window_sec'], fast_cfg['hop_sec'], fast_cfg['block_sec']) == (0.2, 0.05, 0.05)
+      and features.profile_config(fast_cfg, 'legacy')['window_sec'] == 1.0)
+tg = np.arange(2000) / 1000.0
+ranges_fast = features.window_ranges(tg, fast_cfg)
+sizes = [b - a for a, b, _ in ranges_fast]
+check("2 s at 1 kHz -> windows every 50 ms with 200-201 samples (same grid offline and live)",
+      len(ranges_fast) == 36 and min(sizes) >= 200 and max(sizes) <= 201
+      and np.allclose(np.diff([e for _, _, e in ranges_fast]), 0.05), f"{len(ranges_fast)} windows, samples {min(sizes)}-{max(sizes)}")
+block_signal = np.zeros((200, 3))
+block_signal[150:, 0] = np.sin(2 * np.pi * 100 * np.arange(50) / 1000.0)
+fb = features.compute_features(block_signal, np.arange(200) / 1000.0, fast_cfg)
+check("block energy = RMS of the last 50 ms only (window RMS is diluted by the quiet 150 ms before it)",
+      abs(fb['block_rms'] - np.sqrt(0.5 / 3)) < 0.01 and fb['block_rms'] > 1.9 * fb['rms']
+      and 'block_rms' not in features.compute_features(block_signal, np.arange(200) / 1000.0, cfg8),
+      f"block {fb['block_rms']:.3f} window {fb['rms']:.3f}")
+fast_model_stub = {'feature_names': features.TIME_FEATURE_NAMES, 'feature_config': fast_cfg}
+fast_core = vm.DetectionCore(fast_model_stub, dict(vm.DETECTION_DEFAULTS))
+fast_decisions = [fast_core.decide(1.2) for _ in range(16)]
+check("count settings keep their time on the 0.05 s grid: 4/4 -> 16/16 (0.75 s), release 4 -> 16, baseline 8 -> 40 (2 s), CUSUM x5",
+      (fast_core.counts['k'], fast_core.counts['n'], fast_core.counts['release_windows'], fast_core.counts['baseline_windows']) == (16, 16, 16, 40)
+      and abs(fast_core.counts['cusum_threshold'] - 6.0) < 1e-9 and fast_decisions.index('start') == 15, str(fast_core.counts))
+impulse_core = vm.DetectionCore(fast_model_stub, dict(vm.DETECTION_DEFAULTS))
+check("one impulse (4 overlapping 0.2 s windows above threshold) does not trip on the 0.05 s grid",
+      'start' not in [impulse_core.decide(e) for e in [2.0] * 4 + [0.3] * 20])
+legacy_loaded = [features.load_sensor_csv(p) for p in sorted(glob.glob(os.path.join(COPY, "data", "학습 데이터", "*.csv")))
+                 if "이상" not in os.path.basename(p)][:4]
+fast_loaded = [features.load_sensor_csv(os.path.join(syn_raw, r['sensor_file'])) for r in syn_runs if r['run_type'] == 'syn_stable']
+mixed = vm.train_detectors(legacy_loaded + fast_loaded)
+check("mixed training data -> one model per window setting, each remembering its windows",
+      set(mixed) == {'legacy', 'fast'} and mixed['legacy']['feature_config']['hop_sec'] == 0.25
+      and mixed['fast']['feature_config']['window_sec'] == 0.2 and mixed['fast']['profile'] == 'fast'
+      and vm.train_detector(legacy_loaded + fast_loaded)['profile'] == 'legacy',
+      str({p: (m['sessions'], m['windows']) for p, m in mixed.items()}))
+mon2 = vm.VibrationMonitor(FakeSocket(), FakeControllers())
+mon2.set_sensor_info({'device': 'MPU6050', 'fs': 1000.0, 'range_g': 8})
+st2 = mon2.get_status()['window']
+check("1 kHz sensor without 1 kHz training data -> keeps the 1 s model, flagged as fallback and the operator is told",
+      st2['stream_profile'] == 'fast' and st2['profile'] == 'legacy' and st2['fallback']
+      and any(n == 'log_update' and '모델이 없어' in d.get('message', '') for n, d in mon2.socketio.events), str(st2))
+mon2.train_model(legacy_loaded + fast_loaded)
+status2 = mon2.get_status()
+st2 = status2['window']
+check("after adding 1 kHz normal data the 0.2 s / 0.05 s model is used; status lists both models; sensor range kept",
+      st2['profile'] == 'fast' and not st2['fallback'] and st2['hop_sec'] == 0.05 and st2['k'] == 16
+      and set(status2['profiles']) == {'legacy', 'fast'} and mon2.feature_config['accel_range_g'] == 8.0
+      and json.dumps(status2) is not None, str(st2))
+mon2.is_running = True
+clock2 = [5000.0]
+mon2.clock = lambda: clock2[0]
+evaluated = []
+real_evaluate = mon2._evaluate
+
+
+def counting_evaluate(acc, t, now):
+    evaluated.append((float(t[-1]), len(t)))
+    real_evaluate(acc, t, now)
+
+
+mon2._evaluate = counting_evaluate
+stream_run = next(r for r in syn_runs if r['run_type'] == 'syn_stable')
+stream_df = pd.read_csv(os.path.join(syn_raw, stream_run['sensor_file']))
+xyz, ts = stream_df[['AccX', 'AccY', 'AccZ']].to_numpy(), stream_df['DeviceTime'].to_numpy()
+first = int(np.searchsorted(ts, 2.0))
+spent = 0.0
+for i in range(first, first + 3000, 20):  # 3 s of 1 kHz data in 20 ms batches
+    clock2[0] += 0.02
+    started = time.perf_counter()
+    mon2.process_sensor_data(xyz[i:i + 20].tolist(), ts[i:i + 20].tolist())
+    spent += time.perf_counter() - started
+gaps = np.diff([e for e, _ in evaluated])
+per_eval_ms = 1000.0 * spent / max(len(evaluated), 1)
+check("1 kHz stream evaluated every 50 ms with 0.2 s windows; processing per evaluation well under the 50 ms budget",
+      len(evaluated) >= 55 and np.allclose(gaps, 0.05, atol=0.0015) and min(n for _, n in evaluated) >= 199
+      and mon2.latest.get('evidence') is not None and per_eval_ms < 20,
+      f"{len(evaluated)} evaluations, {per_eval_ms:.2f} ms each (incl. features, LOF, decision)")
+mon2.set_sensor_info({'device': 'legacy-json'})  # 헤더 없는 센서: 받은 시각으로 샘플링을 추정
+before_estimate = mon2.profile
+for i in range(first + 3000, first + 4000, 20):
+    clock2[0] += 0.02
+    mon2.process_sensor_data(xyz[i:i + 20].tolist(), ts[i:i + 20].tolist())
+check("no header: falls back to 1 s until the sampling rate is estimated from the timestamps, then 0.2 s",
+      before_estimate == 'legacy' and mon2.stream_profile == 'fast' and mon2.profile == 'fast', f"{before_estimate} -> {mon2.profile}")
+
+print("== rolling baseline (P05) ==")
+
+
+class SelfOnlyCore(vm.DetectionCore):
+    """Evidence = max('self' part, an external 'other' part) so that only the baseline logic is exercised."""
+
+    def score(self, feats, cond=None):
+        parts = {'other': feats.get('other', 0.0)}
+        if self.baseline:
+            parts['self'] = feats['rms'] / self.baseline / self.config['self_ratio']
+        return max(parts.values()), parts, None
+
+
+def run_core(core, rms_values, other=0.0):
+    return [core.step({'rms': float(r), 'other': other}) for r in rms_values]
+
+
+legacy_stub = {'feature_names': features.TIME_FEATURE_NAMES}  # 1 s windows every 0.25 s
+core5 = SelfOnlyCore(legacy_stub, dict(vm.DETECTION_DEFAULTS))
+steps = run_core(core5, [0.1] * 20 + [0.15] * 12)
+first_self = next(i for i, s in enumerate(steps) if 'self' in s['parts'])
+check("baseline starts after half of the 2 s range is filled (window 8, like v1.1) and skips the 3 overlapping windows",
+      first_self == 7 and steps[23]['baseline'] == 0.1 and steps[31]['baseline'] == 0.15,
+      f"first self at {first_self}, baseline at 23: {steps[23]['baseline']}, at 31: {steps[31]['baseline']}")
+ramp = list(np.linspace(0.1, 0.35, 24))
+core5 = SelfOnlyCore(legacy_stub, dict(vm.DETECTION_DEFAULTS))
+steps = run_core(core5, [0.1] * 12 + ramp + [0.35] * 20)
+fixed_self = max(r / 0.1 / 3.0 for r in ramp + [0.35])
+check("slow legitimate increase x3.5 over 6 s (e.g. wider engagement): rolling baseline follows, no alarm "
+      "(the v1.1 fixed cut-start baseline would have reached self 1.17)",
+      not any(s['decision'] == 'start' for s in steps) and max(s['parts'].get('self', 0) for s in steps) < 0.8
+      and fixed_self > 1.0 and abs(steps[-1]['baseline'] - 0.35) < 1e-9,
+      f"max self {max(s['parts'].get('self', 0) for s in steps):.2f}, fixed would be {fixed_self:.2f}")
+core5 = SelfOnlyCore(legacy_stub, dict(vm.DETECTION_DEFAULTS))
+steps = run_core(core5, [0.15] * 12 + [0.04] * 12 + [0.15] * 12)
+check("back to normal cutting after a quiet stretch is not a jump: the cut-start baseline covers the dip "
+      "(rolling alone would have given self 1.25, as in 3 legacy files)",
+      not any(s['decision'] == 'start' for s in steps) and max(s['parts'].get('self', 0) for s in steps[24:]) < 0.8
+      and core5.anchor == 0.15, f"max self after the dip {max(s['parts'].get('self', 0) for s in steps[24:]):.2f}")
+core5 = SelfOnlyCore(legacy_stub, dict(vm.DETECTION_DEFAULTS))
+steps = run_core(core5, [0.1] * 12 + [0.5] * 40)
+check("abrupt x5 jump: alarm after 4 windows and the baseline stays frozen for the whole 10 s anomaly",
+      [s['decision'] for s in steps].index('start') == 15 and core5.alarm and steps[-1]['baseline'] == 0.1,
+      f"start at {[s['decision'] for s in steps].index('start')}, baseline {steps[-1]['baseline']}")
+core5 = SelfOnlyCore(legacy_stub, dict(vm.DETECTION_DEFAULTS))
+steps = run_core(core5, [0.1] * 12) + run_core(core5, ramp + [0.35] * 8, other=0.85)
+check("slow growth while another part already warns (>= 0.8, e.g. spectral): baseline frozen -> self part grows -> alarm",
+      'start' in [s['decision'] for s in steps] and steps[-1]['baseline'] == 0.1)
+core5 = SelfOnlyCore(legacy_stub, dict(vm.DETECTION_DEFAULTS))
+run_core(core5, [0.1] * 12)
+core5.condition_changed()
+rebuilt = run_core(core5, [0.2] * 12)
+core5b = SelfOnlyCore(legacy_stub, dict(vm.DETECTION_DEFAULTS))
+run_core(core5b, [0.1] * 12 + [0.5] * 6)
+core5b.condition_changed()  # online mitigation changed the overrides during the alarm
+kept = run_core(core5b, [0.45] * 4)
+check("speed/feed change without alarm -> baseline rebuilt at the new level; during an alarm (mitigation) it is kept",
+      rebuilt[0]['baseline'] is None and rebuilt[-1]['baseline'] == 0.2 and core5b.alarm
+      and all(s['baseline'] == 0.1 for s in kept), f"kept {[s['baseline'] for s in kept]}")
+core5f = SelfOnlyCore(fast_model_stub, dict(vm.DETECTION_DEFAULTS))
+steps = run_core(core5f, [0.1] * 60)
+first_self = next(i for i, s in enumerate(steps) if 'self' in s['parts'])
+check("0.05 s grid: same times (40-window = 2 s range, 4 overlapping windows skipped, starts after 1 s of normal windows)",
+      core5f.counts['baseline_gap'] == 4 and core5f.counts['baseline_windows'] == 40 and first_self == 23,
+      f"gap {core5f.counts['baseline_gap']}, range {core5f.counts['baseline_windows']}, first self at {first_self}")
+
+
+class RecordingCore:
+    def __init__(self):
+        self.calls, self.config, self.alarm = [], {'decision_mode': 'k_of_n'}, False
+
+    def new_cut(self):
+        self.calls.append('new_cut')
+
+    def condition_changed(self):
+        self.calls.append('changed')
+
+    def step(self, feats, cond=None):
+        self.calls.append('step')
+        return {'decision': None}
+
+
+sim_rows = pd.DataFrame({'gate': [1, 1, 1, 1, 0], 'transient': [0, 0, 1, 0, 0], 'n': [20000, 20000, 20000, 20000, 0],
+                         'F': [100, 100, 80, 80, 0], 'ap': 0.3, 't_host': range(5), 't_rel': range(5), 'rms': 0.1,
+                         'spectral': False, **{name: 0.1 for name in features.TIME_FEATURE_NAMES}})
+recording = RecordingCore()
+ed.simulate_run(recording, sim_rows)
+check("offline evaluation mirrors the live gate: feed change inside a cut -> condition_changed before the transient skip",
+      recording.calls == ['new_cut', 'step', 'step', 'changed', 'step', 'new_cut'], str(recording.calls))
 
 print(f"\nunit checks: {sum(results)}/{len(results)} passed", flush=True)
 os._exit(0 if all(results) else 1)

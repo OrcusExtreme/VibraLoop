@@ -2174,6 +2174,11 @@ function renderVibrationModelStatus(model, message) {
             lines.push(`기준: 진동 크기 ${thresholds.rms_g.toFixed(3)} g, LOF 점수 ${thresholds.lof.toFixed(2)}` +
                 (thresholds.calibration === 'session_holdout' ? ' (파일 단위로 검증한 값)' : ''));
         }
+        const win = model.window || {};
+        if (win.label) {
+            lines.push(`판정 창: ${win.label}` +
+                (win.fallback ? ' (센서 샘플링에 맞는 창의 학습 데이터가 없어 이 모델로 감지 중 - 이 센서로 기록한 정상 데이터를 추가하세요)' : ''));
+        }
         const optimizerInfo = model.optimizer || {};
         lines.push('재가공·온라인 대응 조건: ' + (optimizerInfo.model ? '채터 확률 모델' : '채터 확률 모델 없음 → 채터 주파수 또는 기본 규칙') +
             (model.condition_model ? ', 조건 모델로 진동 크기 비교' : ''));

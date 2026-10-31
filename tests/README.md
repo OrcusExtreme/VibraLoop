@@ -22,7 +22,7 @@ Linux/macOS에서는 `.venv/bin/python tests/run_tests.py`로 실행합니다.
 
 | 묶음 | 파일 | 내용 |
 | :--- | :--- | :--- |
-| `unit` | `unit_checks.py` | 특징 계산, 센서 프로토콜, 최적화기, 재가공 깊이 분할, 판정 규칙, 감지기(가짜 컨트롤러로 진입·대응·정지), 데이터 수집 기록, 실험 NC 생성, 데이터셋→학습→평가, 합성 기록과 평가 기반(P01) |
+| `unit` | `unit_checks.py` | 특징 계산, 센서 프로토콜, 최적화기, 재가공 깊이 분할, 판정 규칙, 감지기(가짜 컨트롤러로 진입·대응·정지), 데이터 수집 기록, 실험 NC 생성, 데이터셋→학습→평가, 합성 기록과 평가 기반(P01), 앨리어싱 마스킹·회전 주파수 추정·채터 주파수 사용 조건(P03), 센서별 창 설정·설정별 모델·실시간 평가 격자와 처리 시간(P04), 롤링 기준선의 시작·멈춤·조건 변경(P05) |
 | `ui` | `ui_events_checks.js`, `ui_vibration_checks.js` | `static/script.js`의 소켓 이벤트 처리, 진동 감지 모델 창·데이터 수집 창 (가짜 DOM) |
 | `e2e` | `e2e_checks.py` | GRBL 시뮬레이터(`grbl_sim.py`)와 실제 `cnc_app`: 스트리밍, 일시정지·재개, 오류 응답, 비상정지, 감시 스레드, 채터 → 온라인 대응 → 위치 유지 정지 → 재가공, 데이터 수집, 모델 관리 API |
 | `bench` | `bench_checks.py` | 합성 시나리오(고정 시드)와 예전 학습 데이터로 감지기를 평가하고 `baseline/`의 기준값과 비교 |
@@ -39,7 +39,10 @@ Linux/macOS에서는 `.venv/bin/python tests/run_tests.py`로 실행합니다.
 
 ## 벤치마크와 기준값
 
-- `baseline/v1.1_synthetic.json`과 `baseline/v1.1_legacy.json`은 v1.1 감지기의 결과입니다. 2026-10-31 P01 시점, 평가 방식도 P01 기준입니다.
+- `baseline/`의 `v1.1_*.json`은 v1.1 감지기의 결과입니다. 평가 방식은 P01 기준입니다.
+  - `v1.1_synthetic.json`: 합성 28개 (센서 DLPF 184 Hz, 스핀들이 지령 회전수대로 돎)
+  - `v1.1_stress.json`: 같은 28개를 DLPF 260 Hz(앨리어싱이 더 큼), 실제 회전수 +2%로 만든 세트. P03 직전 코드로 계산했습니다.
+  - `v1.1_legacy.json`: `data/학습 데이터`의 파일 단위 교차 검증
 - `bench`는 같은 시드로 합성 기록을 다시 만들어 평가하고, 결과를 기준값과 나란히 출력합니다. 바뀐 지표에는 `*`가 붙습니다.
 - 숫자가 달라도 실패로 보지 않습니다. 평가 과정이 끝까지 도는지만 확인합니다.
 - 새 기준값이 필요할 때의 순서:
@@ -54,3 +57,5 @@ python scripts\make_synthetic_runs.py
 python scripts\build_dataset.py --raw data\synthetic\raw --out data\synthetic\dataset
 python scripts\evaluate_detector.py --dataset data\synthetic\dataset --compare tests\baseline\v1.1_synthetic.json
 ```
+
+스트레스 세트는 생성할 때 `--dlpf 260 --rpm-error 0.02`를 붙이고, `v1.1_stress.json`과 비교합니다.

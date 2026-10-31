@@ -6,6 +6,9 @@
    - 현재 깊이로 안전한 조건이 없으면 깊이를 2·3번으로 나눈 경우를 찾습니다 (재가공일 때만)
 2. 채터 주파수 f_c (주파수 특징을 계산할 수 있는 센서일 때)
    - 날 통과 주파수가 f_c의 정수분의 1이 되도록 n = 60 × f_c / (날 수 × k) 중 현재와 가장 가까운 회전수
+   - 센서 샘플링이 날 통과 주파수의 2배를 넘을 때만 씁니다. 1 kHz 센서는 16000–24000 rpm 2날의 날 통과
+     주파수(533–800 Hz)보다 나이퀴스트(500 Hz)가 낮아, 보통 그보다 높은 채터 주파수가 접혀 다른 값으로 보입니다
+     (edit_analysis2.md 2.3). 이때 측정값으로 회전수를 계산하면 엉뚱한 회전수가 나옵니다.
 3. 기본 규칙 (학습 모델도 채터 주파수도 없을 때): 날당 이송을 줄이는 방향
    - 온라인 대응: 회전수 +10%(상한이면 -10%), 이송 -20%
    - 재가공: 회전수 유지, 이송 -20%, 깊이 2번 나눔
@@ -30,6 +33,11 @@ DEFAULT_P_MAX = 0.05
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 STABILITY_MODEL_PATH = os.path.join(MODEL_DIR, "stability_model.joblib")
+
+
+def chatter_frequency_usable(n, flutes, sample_rate):
+    """측정한 채터 주파수로 회전수를 계산해도 되는지: 센서 샘플링이 날 통과 주파수(n × 날 수 / 60)의 2배를 넘어야 합니다."""
+    return bool(n and flutes and sample_rate) and sample_rate > 2.0 * n * flutes / 60.0
 
 
 def load_stability_model(path=STABILITY_MODEL_PATH):
@@ -67,22 +75,30 @@ class CuttingConditionOptimizer:
                 'trained_at': self.bundle.get('trained_at')}
 
     # ------------------------------------------------------------------
-    def suggest(self, n, F, ap=None, chatter_freq=None, flutes=None, purpose='rework'):
+    def suggest(self, n, F, ap=None, chatter_freq=None, flutes=None, purpose='rework', sample_rate=None):
         """현재 조건(n rpm, F mm/min, 깊이 ap mm)에서 바꿀 조건을 제안합니다.
 
         purpose: 'online'(가공 중 오버라이드로 바로 적용, 깊이는 못 바꿈) 또는 'rework'(재가공 파일 생성)
+        sample_rate: 채터 주파수를 잰 센서의 샘플링 (Hz). 모르면 채터 주파수를 쓰지 않습니다.
         반환: {'n', 'F', 'passes', 'method', 'p_chatter', 'reason'} 또는 None(현재 조건을 모를 때)
         """
         if not n or not F or n <= 0 or F <= 0:
             return None
         max_passes = 3 if purpose == 'rework' else 1
-        result = None
+        result, note = None, None
         if self.bundle is not None:
             result = self._from_model(n, F, ap, max_passes)
         if result is None and chatter_freq and flutes:
-            result = self._from_chatter_frequency(n, F, chatter_freq, flutes)
+            if chatter_frequency_usable(n, flutes, sample_rate):
+                result = self._from_chatter_frequency(n, F, chatter_freq, flutes)
+            else:
+                note = (f"측정한 채터 주파수 {chatter_freq:.0f} Hz는 센서 샘플링"
+                        f"({'모름' if not sample_rate else f'{sample_rate:.0f} Hz'})이 날 통과 주파수의 2배보다 낮아 "
+                        "접혀 보인 값일 수 있어 쓰지 않음")
         if result is None:
             result = self._fallback(n, F, purpose)
+            if note:
+                result['reason'] += f"; {note}"
         result['n'] = float(round(result['n']))
         result['F'] = float(round(result['F'], 1))
         return result
@@ -147,9 +163,9 @@ class CuttingConditionOptimizer:
         if purpose == 'online':
             n_new = n * 1.1 if n * 1.1 <= N_RANGE[1] else n * 0.9
             return {'n': n_new, 'F': F * 0.8, 'passes': 1, 'method': 'fallback', 'p_chatter': None,
-                    'reason': "학습된 채터 모델과 채터 주파수가 없어 기본 규칙 적용 (회전수 ±10%, 이송 -20%로 날당 이송 감소)"}
+                    'reason': "학습된 채터 모델과 쓸 수 있는 채터 주파수가 없어 기본 규칙 적용 (회전수 ±10%, 이송 -20%로 날당 이송 감소)"}
         return {'n': n, 'F': F * 0.8, 'passes': 2, 'method': 'fallback', 'p_chatter': None,
-                'reason': "학습된 채터 모델과 채터 주파수가 없어 기본 규칙 적용 (이송 -20%, 깊이 2번 나눔)"}
+                'reason': "학습된 채터 모델과 쓸 수 있는 채터 주파수가 없어 기본 규칙 적용 (이송 -20%, 깊이 2번 나눔)"}
 
 
 def save_stability_model(model, features, path=STABILITY_MODEL_PATH, scaler=None, p_max=DEFAULT_P_MAX, **info):

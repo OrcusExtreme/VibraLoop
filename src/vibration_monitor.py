@@ -2,16 +2,24 @@
 
 감지
 - 특징은 src/features.py 하나로 계산합니다 (학습·실시간 동일, 스무딩 없음, 윈도우마다 평균 제거).
-- hop_sec(0.25초)마다 최근 window_sec(1초) 윈도우를 평가해 '증거값'을 만듭니다. 1 이상이면 기준 초과이고,
+- 창 설정은 센서 샘플링으로 정합니다 (features.WINDOW_PROFILES): 400 Hz 이상이면 0.2초 창을 0.05초마다,
+  기존 센서(약 100 Hz)는 1초 창을 0.25초마다 평가합니다. 감지 모델은 창 설정별로 따로 학습하고(train_detectors),
+  센서에 맞는 설정의 모델이 없으면 다른 설정의 모델로 감지하면서 그 사실을 상태에 표시합니다.
+- 평가 간격마다 최근 윈도우를 평가해 '증거값'을 만듭니다. 1 이상이면 기준 초과이고,
   아래 항목 중 가장 큰 값입니다.
   · lof: LOF 연속 점수 / 정상 데이터에서 세션 단위로 검증한 분위수 기준
          (학습 데이터 하위 10%보다 조용한 윈도우는 제외: 채터는 진동이 커지는 현상)
   · level: 진동 크기(AC RMS) / 정상 가공 윈도우의 분위수 기준 (절대 상한)
-  · self: 같은 컷의 처음 baseline_windows개(약 2초) 대비 진동 크기 비율 / self_ratio
+  · self: 기준선 대비 진동 크기 비율 / self_ratio. 기준선 = max(컷 처음 2초 기준선, 롤링 기준선)이고, 롤링 기준선은
+          현재 윈도우와 겹치지 않는 직전 baseline_windows개(2초)에서 정상으로 보인 윈도우 RMS의 중앙값입니다.
+          경보 중이거나 증거값이 release_level 이상인 윈도우는 넣지 않아 이상이 보이면 멈춥니다.
+          경보가 없을 때 회전수·이송이 바뀌면 다시 쌓습니다 (경보 중에는 이상 전 기준선 유지).
   · condition: 조건 모델(models/condition_model.joblib)이 있으면 (회전수, 이송, 깊이)로 예측한 진동 크기 대비 z 점수 / condition_z
   · spectral: 주파수 특징을 쓸 수 있으면 회전 고조파가 아닌 에너지 비율 / nonharmonic_ratio_thr (봉우리가 뚜렷할 때)
+    고조파는 접혀(앨리어싱) 보이는 위치까지 빼고, 회전 주파수는 스펙트럼에서 다시 찾습니다 (features.spectral_features)
 - 판정: 최근 n개 중 k개 초과(k_of_n, 기본 4개 중 4개 = 1초 연속) 또는 CUSUM. 해제는 release_level 미만이
-  release_windows번 연속일 때 (히스테리시스).
+  release_windows번 연속일 때 (히스테리시스). k, n, release_windows, baseline_windows, cusum_threshold는
+  0.25초 간격 기준 값이고, 0.05초 간격에서는 같은 시간이 되도록 늘려 씁니다 (DetectionCore.window_counts).
 - 판정 구간: 가공 중이고 GRBL이 Run, 공구가 소재 안(Z ≤ -gate_depth_mm), 스핀들이 돌 때만.
   진입 직후와 조건(회전수·이송·오버라이드) 변경 직후 transient_sec는 제외합니다.
 대응
@@ -60,13 +68,15 @@ DETECTION_DEFAULTS = {
     'min_training_windows': 30,
     # 판정
     'decision_mode': 'k_of_n',     # 'k_of_n' 또는 'cusum'
+    # 아래 개수(k, n, release_windows, baseline_windows)와 cusum_threshold는 0.25초 간격 기준입니다.
+    # 다른 간격(고속 0.05초)에서는 첫 윈도우부터 마지막 윈도우까지의 시간이 같도록 늘려 씁니다.
     'k': 4,                        # 최근 n개 윈도우 중 k개 초과 (0.25초 간격이면 4개 = 1초 연속)
     'n': 4,
     'cusum_drift': 0.0,            # CUSUM: 누적값 = max(0, 누적값 + ln(증거값) - drift)
     'cusum_threshold': 1.2,
     'release_level': 0.8,
     'release_windows': 4,
-    # 같은 컷의 처음 구간을 기준으로 삼는 비교
+    # 직전 구간(롤링 기준선)과의 비교: 현재 윈도우와 겹치지 않는 직전 baseline_windows개(0.25초 기준 8개 = 2초)
     'baseline_windows': 8,
     'self_ratio': 3.0,
     # 조건 모델·주파수 특징
@@ -82,6 +92,10 @@ DETECTION_DEFAULTS = {
     'rework_min_passes': 2,
     'status_emit_interval': 0.5,
 }
+REFERENCE_HOP_SEC = 0.25   # DETECTION_DEFAULTS의 개수 설정을 정한 평가 간격
+PROFILE_LABELS = {'legacy': '1초 창·0.25초 간격', 'fast': '0.2초 창·0.05초 간격'}
+MAX_EVALS_PER_BATCH = 4    # 한 번에 받은 샘플로 평가할 윈도우 수 상한 (더 밀리면 최신 윈도우로 건너뜀)
+
 # 화면(모델 관리 창)에서 바꿀 수 있고 data/detector_settings.json에 저장되는 설정
 RUNTIME_SETTINGS = {
     'mitigation_enabled': lambda v: bool(v),
@@ -172,29 +186,57 @@ def _as_sessions(sensor_data, default_fs=100.0):
     return sessions
 
 
-def train_detector(sensor_data, config=None):
-    """정상 가공 센서 데이터로 감지 모델(dict)을 학습합니다. 학습할 윈도우가 부족하면 ValueError."""
+def _session_fs(session):
+    """세션(연속 구간 목록)의 샘플링 (구간별 추정값의 중앙값, 모르면 None)"""
+    values = [features.estimate_fs(t) for _, t in session]
+    values = [fs for fs in values if fs]
+    return float(np.median(values)) if values else None
+
+
+def train_detectors(sensor_data, config=None):
+    """정상 가공 센서 데이터로 창 설정별 감지 모델을 학습합니다 → {'legacy': 모델, 'fast': 모델}.
+
+    파일(세션)마다 샘플링으로 창 설정을 정하고(features.window_profile), 같은 설정의 세션끼리 학습합니다.
+    윈도우가 부족한 설정은 건너뛰고, 학습한 모델이 하나도 없으면 ValueError.
+    """
     config = dict(DETECTION_DEFAULTS, **(config or {}))
-    feat_config = features.feature_config(config)
-    sessions = []
+    base = features.feature_config(config)
+    grouped = {}
     for session in _as_sessions(sensor_data):
+        profile = features.window_profile(_session_fs(session), base)
+        feat_config = features.profile_config(base, profile)
         rows = []
         for acc, t in session:
             rows.extend(f for _, f in features.session_windows(acc, t, feat_config))
         if rows:
-            sessions.append(rows)
-    return fit_detector(sessions, config)
+            grouped.setdefault(profile, []).append(rows)
+    models, errors = {}, []
+    for profile, sessions in grouped.items():
+        try:
+            models[profile] = fit_detector(sessions, config, profile)
+        except ValueError as e:
+            errors.append(f"{PROFILE_LABELS[profile]}: {e}")
+    if not models:
+        raise ValueError("; ".join(errors) or "학습할 가공 구간이 없습니다.")
+    return models
 
 
-def fit_detector(sessions, config=None):
+def train_detector(sensor_data, config=None):
+    """감지 모델 하나를 학습합니다 (창 설정이 섞인 데이터면 저속 'legacy' 모델). 윈도우가 부족하면 ValueError."""
+    models = train_detectors(sensor_data, config)
+    return models.get('legacy') or next(iter(models.values()))
+
+
+def fit_detector(sessions, config=None, profile='legacy'):
     """세션별 윈도우 특징 목록(sessions: [[특징 dict, ...], ...])으로 감지 모델을 학습합니다.
 
     LOF 기준은 세션(파일·실행)을 하나씩 빼고 학습한 모델로 그 세션을 채점한 점수의 분위수입니다.
     같은 세션의 겹치는 윈도우로 기준을 정하면 실제보다 낙관적인 기준이 되기 때문입니다.
+    profile: 윈도우를 만든 창 설정. 모델에 그 설정(feature_config)을 저장해 실시간도 같은 창으로 평가합니다.
     scripts/evaluate_detector.py는 데이터셋의 윈도우 특징으로 이 함수를 직접 부릅니다.
     """
     config = dict(DETECTION_DEFAULTS, **(config or {}))
-    feat_config = features.feature_config(config)
+    feat_config = features.profile_config(features.feature_config(config), profile)
     per_session = [(np.array([features.feature_vector(f) for f in rows]), np.array([f['rms'] for f in rows]))
                    for rows in sessions if rows]
     fs_values = [f['fs'] for rows in sessions for f in rows if f.get('fs')]
@@ -227,6 +269,7 @@ def fit_detector(sessions, config=None):
     rms_all = np.concatenate([rms for _, rms in per_session])
     return {
         'version': features.FEATURE_VERSION,
+        'profile': profile,
         'feature_names': list(features.TIME_FEATURE_NAMES),
         'feature_config': feat_config,
         'scaler': scaler,
@@ -251,14 +294,44 @@ class DetectionCore:
         self.condition_model = condition_model
         self.new_cut()
 
+    def window_counts(self):
+        """개수 설정(0.25초 간격 기준)을 이 모델의 평가 간격에 맞춥니다.
+
+        k, n, release_windows는 첫 윈도우부터 마지막 윈도우까지의 시간이 같도록 (개수-1)×배율+1로,
+        baseline_windows는 같은 시간을 덮도록 개수×배율로 늘립니다. CUSUM은 윈도우마다 더하므로 기준을 배율만큼 키웁니다.
+        """
+        feature_config = self.model.get('feature_config') or {}
+        hop = feature_config.get('hop_sec') or REFERENCE_HOP_SEC
+        window = feature_config.get('window_sec') or features.DEFAULT_FEATURE_CONFIG['window_sec']
+        scale = REFERENCE_HOP_SEC / hop
+        cfg = self.config
+
+        def stretch(count):
+            return int(round((int(count) - 1) * scale)) + 1
+
+        return {'k': stretch(cfg['k']), 'n': stretch(cfg['n']), 'release_windows': stretch(cfg['release_windows']),
+                'baseline_windows': max(1, int(round(cfg['baseline_windows'] * scale))),
+                # 현재 윈도우와 겹치는 직전 윈도우 수 + 1: 이만큼 앞의 윈도우부터 기준선에 씁니다
+                'baseline_gap': max(1, int(round(window / hop))),
+                'cusum_threshold': cfg['cusum_threshold'] * scale, 'hop_sec': hop}
+
     def new_cut(self):
         """새 컷(판정 구간 시작)마다 기준 구간과 판정 상태를 초기화합니다."""
-        self.recent = deque(maxlen=int(self.config['n']))
+        self.counts = self.window_counts()
+        self.recent = deque(maxlen=self.counts['n'])
         self.cusum = 0.0
         self.alarm = False
         self.release_count = 0
-        self.baseline_values = []
-        self.baseline = None
+        self.reset_baseline()
+
+    def reset_baseline(self):
+        """기준선을 비우고 다시 쌓습니다 (새 컷, 또는 경보가 없을 때 회전수·이송이 바뀐 뒤)."""
+        self.window_index = 0
+        self.baseline_pool = deque()  # (윈도우 번호, RMS): 정상으로 보인 윈도우만
+        self.anchor_values = []       # 컷 처음 baseline_windows개의 정상 윈도우 RMS
+        self.anchor = None            # 컷 처음 기준선 (그 중앙값, 이후 고정)
+        self.rolling = None           # 롤링 기준선
+        self.baseline = None          # 실제로 쓰는 기준선 = max(컷 처음, 롤링)
 
     def score(self, feats, cond=None):
         """윈도우 특징 → (증거값, 항목별 값, 채터 주파수 또는 None)"""
@@ -290,23 +363,44 @@ class DetectionCore:
         evidence = max(parts.values())
         return evidence, parts, chatter_freq
 
-    def _update_baseline(self, feats, parts):
-        """컷 처음의 정상으로 보이는 윈도우(절대 상한 미만)로 기준 진동 크기를 정합니다."""
-        if self.baseline is not None or parts.get('level', 0) >= 1.0:
-            return
-        self.baseline_values.append(feats['rms'])
-        if len(self.baseline_values) >= self.config['baseline_windows']:
-            self.baseline = float(np.median(self.baseline_values))
+    def _refresh_baseline(self):
+        """지금 윈도우의 기준선을 정합니다 (edit_analysis2.md P05).
+
+        롤링 기준선 = 이 윈도우와 겹치지 않는 직전 baseline_windows개(2초) 범위에서 정상으로 보인 윈도우 RMS의 중앙값.
+        범위 안에 정상 윈도우가 절반보다 적으면(이상이 이어지는 중) 롤링 기준선을 바꾸지 않습니다.
+        쓰는 기준선은 컷 처음 기준선과 롤링 기준선 중 큰 값입니다: 정상적으로 커진 진동(맞물림·가공 폭 증가)은 롤링
+        기준선이 따라가 오경보를 막고, 가벼운 구간 뒤 정상 가공으로 돌아올 때는 컷 처음 기준선이 3배 급증으로 보지 않게 합니다.
+        """
+        counts = self.counts
+        newest = self.window_index - counts['baseline_gap']
+        oldest = newest - counts['baseline_windows'] + 1
+        while self.baseline_pool and self.baseline_pool[0][0] < oldest:
+            self.baseline_pool.popleft()
+        values = [rms for index, rms in self.baseline_pool if index <= newest]
+        if len(values) >= max(1, counts['baseline_windows'] // 2):
+            self.rolling = float(np.median(values))
+        candidates = [value for value in (self.anchor, self.rolling) if value]
+        self.baseline = max(candidates) if candidates else None
+
+    def _admit_baseline(self, feats, evidence):
+        """정상으로 보인 윈도우만 기준선 후보로 넣습니다. 경보 중이거나 증거값이 release_level 이상이면 넣지 않으므로,
+        이상이 보이기 시작하면 기준선이 멈춰 천천히 커지는 채터를 따라가지 않습니다."""
+        if not self.alarm and evidence < self.config['release_level']:
+            self.baseline_pool.append((self.window_index, feats['rms']))
+            if self.anchor is None:
+                self.anchor_values.append(feats['rms'])
+                if len(self.anchor_values) >= self.counts['baseline_windows']:
+                    self.anchor = float(np.median(self.anchor_values))
 
     def decide(self, evidence):
         """판정 상태 갱신 → 'start'(경보 시작), 'end'(해제), None"""
-        cfg = self.config
+        cfg, counts = self.config, self.counts
         if cfg['decision_mode'] == 'cusum':
             self.cusum = max(0.0, self.cusum + math.log(max(evidence, 1e-6)) - cfg['cusum_drift'])
-            triggered = self.cusum >= cfg['cusum_threshold']
+            triggered = self.cusum >= counts['cusum_threshold']
         else:
             self.recent.append(evidence >= 1.0)
-            triggered = sum(self.recent) >= cfg['k']
+            triggered = sum(self.recent) >= counts['k']
         if not self.alarm:
             if triggered:
                 self.alarm = True
@@ -314,7 +408,7 @@ class DetectionCore:
                 return 'start'
             return None
         self.release_count = self.release_count + 1 if evidence < cfg['release_level'] else 0
-        if self.release_count >= cfg['release_windows']:
+        if self.release_count >= counts['release_windows']:
             self.alarm = False
             self.recent.clear()
             self.cusum = 0.0
@@ -323,11 +417,19 @@ class DetectionCore:
 
     def step(self, feats, cond=None):
         """판정 구간 안의 윈도우 하나를 처리합니다."""
+        self._refresh_baseline()
         evidence, parts, chatter_freq = self.score(feats, cond)
-        self._update_baseline(feats, parts)
+        self._admit_baseline(feats, evidence)
         decision = self.decide(evidence)
-        return {'evidence': evidence, 'parts': parts, 'chatter_freq': chatter_freq,
-                'decision': decision, 'alarm': self.alarm}
+        self.window_index += 1
+        return {'evidence': evidence, 'parts': parts, 'chatter_freq': chatter_freq, 'fs': feats.get('fs'),
+                'baseline': self.baseline, 'decision': decision, 'alarm': self.alarm}
+
+    def condition_changed(self):
+        """판정 구간 안에서 회전수·이송(오버라이드)이 바뀌었을 때. 경보가 없으면 기준선을 새 조건으로 다시 쌓고,
+        경보 중(온라인 대응 중)이면 이상 전 기준선을 그대로 둬서 대응 뒤에도 같은 기준으로 진정 여부를 봅니다."""
+        if not self.alarm:
+            self.reset_baseline()
 
 
 class VibrationMonitor:
@@ -335,13 +437,19 @@ class VibrationMonitor:
         self.socketio = socketio
         self.controllers = controllers
         self.config = dict(DETECTION_DEFAULTS, **load_settings())
-        self.feature_config = features.feature_config(self.config)
+        self.feature_config = features.profile_config(features.feature_config(self.config), 'legacy')
         self.optimizer = CuttingConditionOptimizer()
         self.condition_model = load_condition_model()
         self.clock = time.time
 
-        self.model = None
+        self.models = {}            # 창 설정별 감지 모델 {'legacy': ..., 'fast': ...}
+        self.cores = {}
+        self.model = None           # 지금 쓰는 모델 (센서 창 설정에 맞는 것, 없으면 다른 설정)
         self.core = None
+        self.profile = None         # 지금 쓰는 모델의 창 설정
+        self.stream_profile = None  # 센서 샘플링으로 정한 창 설정 (모르면 None)
+        self.fallback = False       # 센서 창 설정의 모델이 없어 다른 설정의 모델을 쓰는 중
+        self.range_g = None         # 센서 측정 범위 (헤더)
         self.is_trained = False
         self.training_files = []    # 현재 모델 학습에 사용한 파일 이름
         self.training_samples = 0   # 현재 모델 학습에 사용한 샘플 수
@@ -358,20 +466,65 @@ class VibrationMonitor:
 
     # ------------------------------------------------------------------ 학습
     def train_model(self, sensor_data):
-        """정상 가공 데이터로 학습합니다. 실패하면 기존 모델을 그대로 둡니다. 성공 여부를 반환합니다."""
+        """정상 가공 데이터로 창 설정별 모델을 학습합니다. 실패하면 기존 모델을 그대로 둡니다. 성공 여부를 반환합니다."""
         try:
-            model = train_detector(sensor_data, self.config)
+            models = train_detectors(sensor_data, self.config)
         except Exception as e:
             logger.error(f"모델 학습 중 오류 발생: {e}")
             return False
         with self._model_lock:
-            self.model = model
-            self.core = DetectionCore(model, self.config, self.condition_model)
+            self.models = models
+            self.cores = {profile: DetectionCore(model, self.config, self.condition_model)
+                          for profile, model in models.items()}
             self.is_trained = True
-            self.training_windows = model['windows']
-        logger.info(f"모델 학습 완료 (세션 {model['sessions']}개, 가공 윈도우 {model['windows']}개, "
-                    f"LOF 기준 {model['lof_threshold']:.2f}, 진동 크기 기준 {model['rms_threshold']:.3f} g)")
+            self.training_windows = sum(model['windows'] for model in models.values())
+            self._select_model()
+        for profile, model in models.items():
+            logger.info(f"모델 학습 완료 ({PROFILE_LABELS[profile]}: 세션 {model['sessions']}개, 가공 윈도우 {model['windows']}개, "
+                        f"LOF 기준 {model['lof_threshold']:.2f}, 진동 크기 기준 {model['rms_threshold']:.3f} g)")
         return True
+
+    def _select_model(self):
+        """센서 창 설정에 맞는 모델을 고릅니다. 그 설정의 모델이 없으면 저속 모델(없으면 있는 모델)을 씁니다.
+        실시간 윈도우는 고른 모델의 창 설정으로 만듭니다. _model_lock을 잡은 상태에서 부릅니다."""
+        wanted = self.stream_profile or 'legacy'
+        if wanted in self.models:
+            profile = wanted
+        else:
+            profile = 'legacy' if 'legacy' in self.models else next(iter(self.models), None)
+        self.profile = profile
+        self.model = self.models.get(profile)
+        self.core = self.cores.get(profile)
+        if self.model:
+            config = dict(self.model['feature_config'])
+        else:
+            config = features.profile_config(features.feature_config(self.config), wanted)
+        if self.range_g:
+            config['accel_range_g'] = self.range_g
+        self.feature_config = config
+        self.fallback = self.model is not None and profile != wanted
+
+    def _set_stream_profile(self, profile):
+        """센서 창 설정을 정하고 모델을 다시 고릅니다. 쓰는 창 설정이 바뀌면 판정 상태와 평가 시각을 처음부터 맞춥니다."""
+        changed = profile != self.stream_profile
+        self.stream_profile = profile
+        with self._model_lock:
+            previous = self.profile
+            self._select_model()
+            switched = previous != self.profile
+            if switched and self.core:
+                self.core.new_cut()
+        if switched:
+            with self._stream_lock:
+                self._next_eval = None
+        if changed and profile and self.is_trained:
+            fs = self.sensor_info.get('fs')
+            source = f"센서 {fs:.0f} Hz" if fs else "센서 샘플링"
+            if self.fallback:
+                self._log(f"{source}에 맞는 {PROFILE_LABELS[profile]} 감지 모델이 없어 {PROFILE_LABELS[self.profile]} 모델로 감지합니다. "
+                          "이 센서로 기록한 정상 가공 데이터를 학습 데이터에 추가하세요.", "orange")
+            else:
+                logger.info(f"{source} → {PROFILE_LABELS[self.profile]}으로 이상 진동을 판정합니다.")
 
     def _training_paths(self):
         master_path = os.path.join(TRAINING_DATA_DIR, MASTER_DATASET_NAME)
@@ -413,9 +566,10 @@ class VibrationMonitor:
             return False
 
     def get_status(self):
-        """모델 관리 창에 표시할 학습 상태와 설정을 반환합니다."""
+        """모델 관리 창에 표시할 학습 상태와 설정을 반환합니다 (모델 관련 값은 지금 쓰는 모델 기준)."""
         model = self.model or {}
         latest = dict(self.latest) if self.latest else {}
+        counts = self.core.counts if self.core else {}
         return {
             'is_trained': self.is_trained,
             'is_training': self._training_lock.locked(),
@@ -429,6 +583,13 @@ class VibrationMonitor:
                            'calibration': model.get('lof_calibration')},
             'settings': {key: self.config[key] for key in ('mitigation_enabled', 'decision_mode', 'k', 'n',
                                                              'mitigation_wait_sec', 'rework_min_passes')},
+            'window': {'profile': self.profile, 'label': PROFILE_LABELS.get(self.profile),
+                       'stream_profile': self.stream_profile, 'fallback': self.fallback,
+                       'window_sec': self.feature_config.get('window_sec'), 'hop_sec': self.feature_config.get('hop_sec'),
+                       'k': counts.get('k'), 'n': counts.get('n')},
+            'profiles': {profile: {'label': PROFILE_LABELS[profile], 'sessions': m.get('sessions'),
+                                   'windows': m.get('windows'), 'fs': m.get('fs_median')}
+                         for profile, m in self.models.items()},
             'condition_model': self.condition_model is not None,
             'optimizer': self.optimizer.describe(),
             'sensor': dict(self.sensor_info),
@@ -446,9 +607,9 @@ class VibrationMonitor:
         self.config.update(applied)
         save_settings(self.config)
         with self._model_lock:
-            if self.core:
-                self.core.config = self.config
-                self.core.new_cut()
+            for core in self.cores.values():
+                core.config = self.config
+                core.new_cut()
         return True, "설정을 저장했습니다."
 
     def add_training_file(self, filename, content):
@@ -555,20 +716,24 @@ class VibrationMonitor:
                 self.core.new_cut()
 
     def set_sensor_info(self, info):
-        """센서 스트림 정보(장치, 샘플링, 측정 범위)를 반영합니다."""
+        """센서 스트림 정보(장치, 샘플링, 측정 범위)를 반영하고, 샘플링에 맞는 창 설정의 모델을 고릅니다.
+        샘플링을 모르면(헤더 없는 기존 펌웨어) 받은 샘플 시각으로 추정합니다 (process_sensor_data)."""
         self.sensor_info = dict(info or {})
-        if info and info.get('range_g'):
-            self.feature_config['accel_range_g'] = float(info['range_g'])
+        self.range_g = float(info['range_g']) if info and info.get('range_g') else None
+        fs = self.sensor_info.get('fs')
+        self._set_stream_profile(features.window_profile(fs, self.feature_config) if fs else None)
 
     def process_sensor_data(self, samples, timestamps=None):
-        """센서 샘플을 받아 시간 기준 윈도우가 찰 때마다 평가합니다.
+        """센서 샘플을 받아 평가 시각마다 윈도우를 평가합니다.
 
+        평가 시각은 첫 윈도우 끝에서 hop_sec씩 늘어나는 격자라서 오프라인(features.window_ranges)과 같습니다.
         samples: [[ax, ay, az], ...] (g), timestamps: 샘플별 측정 시각(초, 장치 시각 권장). 없으면 받은 시각.
         """
         if not self.is_running or not self.is_trained:
             return
         now = self.clock()
         cfg = self.feature_config
+        estimate = None
         with self._stream_lock:
             for i, sample in enumerate(samples):
                 try:
@@ -587,21 +752,35 @@ class VibrationMonitor:
                 self._last_t = t
             if not self._buf_t:
                 return
+            if self.stream_profile is None and self._buf_t[-1] - self._buf_t[0] >= 0.5 and len(self._buf_t) >= 10:
+                estimate = features.estimate_fs(np.fromiter(self._buf_t, dtype=float, count=len(self._buf_t)))
+        if estimate:
+            self._set_stream_profile(features.window_profile(estimate, cfg))
+            cfg = self.feature_config
+        with self._stream_lock:
+            if not self._buf_t:
+                return
             t_last = self._buf_t[-1]
             while self._buf_t and self._buf_t[0] < t_last - cfg['window_sec'] - 0.5:
                 self._buf_t.popleft()
                 self._buf_a.popleft()
             if self._next_eval is None:
                 self._next_eval = self._buf_t[0] + cfg['window_sec']
-            if t_last < self._next_eval:
+            ends = []
+            while self._next_eval <= t_last and len(ends) < MAX_EVALS_PER_BATCH:
+                ends.append(self._next_eval)
+                self._next_eval += cfg['hop_sec']
+            if self._next_eval <= t_last:  # 너무 밀렸으면 지난 윈도우는 건너뜀
+                self._next_eval = t_last + cfg['hop_sec']
+            if not ends:
                 return
-            self._next_eval = t_last + cfg['hop_sec']
             t_arr = np.fromiter(self._buf_t, dtype=float, count=len(self._buf_t))
             a_arr = np.array(self._buf_a, dtype=float)
-        selected = t_arr >= t_last - cfg['window_sec']
-        if not features.window_is_usable(t_arr[selected], cfg, features.estimate_fs(t_arr)):
-            return
-        self._evaluate(a_arr[selected], t_arr[selected], now)
+        nominal_fs = features.estimate_fs(t_arr)
+        for end in ends:
+            selected = (t_arr >= end - cfg['window_sec']) & (t_arr <= end)
+            if features.window_is_usable(t_arr[selected], cfg, nominal_fs):
+                self._evaluate(a_arr[selected], t_arr[selected], now)
 
     def _gate(self, now):
         """판정 구간 여부와 현재 절삭 조건. 컷이 새로 시작되면 판정 상태를 초기화합니다."""
@@ -626,12 +805,17 @@ class VibrationMonitor:
                 with self._model_lock:
                     if self.core:
                         self.core.new_cut()
+            elif gate:  # 판정 구간 안에서 회전수·이송(오버라이드)이 바뀜
+                with self._model_lock:
+                    if self.core:
+                        self.core.condition_changed()
             self._signature = signature
             self._changed_at = now
         if not gate and self._gate_was_on:
             self._leave_cut()
         self._gate_was_on = gate
-        cond['transient'] = now - self._changed_at < self.config['transient_sec']
+        # 경계(정확히 transient_sec 뒤)에서 부동소수점 오차로 판정이 흔들리지 않도록 아주 작은 여유를 둡니다
+        cond['transient'] = now - self._changed_at < self.config['transient_sec'] - 1e-6
         return gate, cond
 
     def _leave_cut(self):
@@ -682,7 +866,7 @@ class VibrationMonitor:
         mitigate = bool(self.config['mitigation_enabled'] and cond.get('n_cmd') and cond.get('F_cmd')
                         and not self._mitigated_in_cut)
         self.event = {'started': now, 'stage': 'detected', 'cond': dict(cond), 'evidence': step['evidence'],
-                      'parts': dict(step['parts']), 'chatter_freq': step['chatter_freq']}
+                      'parts': dict(step['parts']), 'chatter_freq': step['chatter_freq'], 'fs': step.get('fs')}
         main_part = max(step['parts'], key=step['parts'].get)
         self._log(f"⚠️ 이상 진동 감지 (지표 {step['evidence']:.2f}, 주요 원인 {main_part})", "orange")
         self.socketio.emit('vibration_alert', {'show': True, 'evidence': step['evidence'],
@@ -705,7 +889,7 @@ class VibrationMonitor:
         event = self.event
         cond = event['cond']
         suggestion = self.optimizer.suggest(cond.get('n'), cond.get('F'), cond.get('ap'), event['chatter_freq'],
-                                            cond.get('flutes'), purpose='online')
+                                            cond.get('flutes'), purpose='online', sample_rate=event.get('fs'))
         if not suggestion:
             self._stop_and_rework("현재 회전수·이송을 알 수 없어 온라인 대응 없이 정지합니다.")
             return
@@ -744,7 +928,7 @@ class VibrationMonitor:
         _, cond = self._gate(self.clock())
         chatter_freq = self.latest.get('chatter_freq') if self.latest else None
         self.event = {'started': self.clock(), 'stage': 'detected', 'cond': dict(cond), 'evidence': None,
-                      'parts': {}, 'chatter_freq': chatter_freq}
+                      'parts': {}, 'chatter_freq': chatter_freq, 'fs': self.latest.get('fs') if self.latest else None}
         self.socketio.emit('vibration_alert', {'show': True, 'message': "⚠️ 이상 진동 감지"})
         self._record(cond, None, chatter_freq, 'stop')
         self._stop_and_rework("이상 진동 감지로 정지합니다.")
@@ -781,7 +965,7 @@ class VibrationMonitor:
 
             cond = event.get('cond') or {}
             suggestion = self.optimizer.suggest(cond.get('n'), cond.get('F'), cond.get('ap'), event.get('chatter_freq'),
-                                                cond.get('flutes'), purpose='rework')
+                                                cond.get('flutes'), purpose='rework', sample_rate=event.get('fs'))
             if suggestion is None:
                 self._log("현재 회전수·이송을 알 수 없어 재가공 파일을 만들지 않습니다.", "red")
                 return

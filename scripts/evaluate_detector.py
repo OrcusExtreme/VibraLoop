@@ -12,6 +12,7 @@
   경보 시각은 경보를 낸 윈도우의 끝 시각이므로 지연은 윈도우 이동 간격 단위로 나옵니다.
 - 오경보: 채터 구간 근처(앞뒤 2초)가 아닌 곳의 경보 수, 안정 가공 1시간당 횟수
 - 실행 종류(run_type)별 집계, 경보 경로(판정 방식)별 감지·오경보 수
+창 설정(센서 샘플링: 1초 창·0.25초 간격 / 0.2초 창·0.05초 간격)이 다른 실행은 따로 교차 검증합니다.
 감지기는 실시간과 같은 코드(src/vibration_monitor.py의 fit_detector, DetectionCore)로 학습·판정합니다.
 평가하는 실행·파일은 학습에서 빼므로(교차 검증) 처음 보는 가공에서의 성능을 추정합니다.
 """
@@ -65,18 +66,23 @@ def row_features(row):
 
 
 def simulate_run(core, run_rows):
-    """실행 하나를 시간 순서대로 판정 → [(경보 시작 시각, 경보 경로, 실행 시작부터 초)]"""
+    """실행 하나를 시간 순서대로 판정 → [(경보 시작 시각, 경보 경로, 실행 시작부터 초)]
+    실시간(VibrationMonitor._gate)과 같이 판정 구간 안에서 회전수·이송이 바뀌면 core.condition_changed()를 부릅니다."""
     alarms = []
-    in_cut = False
+    in_cut, last_condition = False, None
     for _, row in run_rows.iterrows():
         if not row['gate']:
             if in_cut:
                 core.new_cut()
             in_cut = False
             continue
+        condition = (round(row['n']) if pd.notna(row['n']) else 0, round(row['F'], 1) if pd.notna(row['F']) else 0)
         if not in_cut:
             core.new_cut()
             in_cut = True
+        elif condition != last_condition:
+            core.condition_changed()
+        last_condition = condition
         if row['transient']:
             continue
         cond = {'n': row['n'], 'F': row['F'], 'ap': row['ap']}
@@ -176,41 +182,54 @@ def evaluate_dataset(dataset_dir, config):
     if not os.path.exists(path):
         sys.exit(f"{path}가 없습니다. 먼저 python scripts/build_dataset.py를 실행하세요.")
     df = pd.read_csv(path, encoding='utf-8-sig', dtype={'run_id': str}).sort_values(['run_id', 't_host'])
-    run_ids = df['run_id'].unique()
-    if len(run_ids) < 2:
-        sys.exit("교차 검증에는 실행이 2개 이상 필요합니다.")
+    if 'profile' not in df.columns:  # P04 이전 데이터셋은 모두 1초 창
+        df['profile'] = 'legacy'
     full = dict(vm.DETECTION_DEFAULTS, **config)
-    window_sec = config.get('window_sec', features.DEFAULT_FEATURE_CONFIG['window_sec'])
     label_events = load_label_events(dataset_dir)
     overall, by_type = Tally(), defaultdict(Tally)
     trips = defaultdict(lambda: {'detections': 0, 'false_alarms': 0})
-    folds = GroupKFold(n_splits=min(5, len(run_ids))).split(run_ids, groups=run_ids)
-    for fold, (train_idx, test_idx) in enumerate(folds, start=1):
-        train_runs, test_runs = set(run_ids[train_idx]), set(run_ids[test_idx])
-        sessions = []
-        for run_id in sorted(train_runs):
-            stable = df[(df['run_id'] == run_id) & (df['gate'] == 1) & (df['transient'] == 0) & (df['label'] == 'stable')]
-            sessions.append([row_features(row) for _, row in stable.iterrows()])
-        try:
-            model = vm.fit_detector(sessions, config)
-        except ValueError as e:
-            print(f"  fold {fold}: 학습 실패 ({e})")
+    used_profiles = {}
+    # 창 설정마다 따로 교차 검증합니다 (모델은 같은 창 설정의 윈도우로만 학습하므로)
+    for profile in sorted(df['profile'].unique()):
+        part = df[df['profile'] == profile]
+        run_ids = part['run_id'].unique()
+        label = vm.PROFILE_LABELS.get(profile, profile)
+        if len(run_ids) < 2:
+            print(f"  [{label}] 실행이 {len(run_ids)}개뿐이라 교차 검증하지 않습니다.")
             continue
-        core = vm.DetectionCore(model, full)
-        for run_id in sorted(test_runs):
-            rows = df[df['run_id'] == run_id]
-            alarms = simulate_run(core, rows)
-            events = label_events.get(run_id, []) if label_events is not None else chatter_events(rows, window_sec)
-            run_type = rows['run_type'].iloc[0] if 'run_type' in rows.columns else None
-            run_type = str(run_type) if run_type is not None and pd.notna(run_type) and str(run_type) else '(없음)'
-            latencies = score_run(rows, alarms, events, (overall, by_type[run_type]), trips)
-            when = (" (" + ", ".join(_seconds(a[2]) for a in alarms) + "초)") if alarms else ""
-            delay = (", 지연 " + ", ".join(f"{x:.2f}" for x in latencies) + "초") if latencies else ""
-            print(f"  {run_id}: 채터 사례 {len(events)}개, 경보 {len(alarms)}회{when}{delay}")
+        print(f"  [{label}] 실행 {len(run_ids)}개")
+        used_profiles[profile] = dict(features.WINDOW_PROFILES[profile])
+        window_sec = features.WINDOW_PROFILES[profile]['window_sec']
+        folds = GroupKFold(n_splits=min(5, len(run_ids))).split(run_ids, groups=run_ids)
+        for fold, (train_idx, test_idx) in enumerate(folds, start=1):
+            train_runs, test_runs = set(run_ids[train_idx]), set(run_ids[test_idx])
+            sessions = []
+            for run_id in sorted(train_runs):
+                stable = part[(part['run_id'] == run_id) & (part['gate'] == 1) & (part['transient'] == 0)
+                              & (part['label'] == 'stable')]
+                sessions.append([row_features(row) for _, row in stable.iterrows()])
+            try:
+                model = vm.fit_detector(sessions, config, profile)
+            except ValueError as e:
+                print(f"  fold {fold}: 학습 실패 ({e})")
+                continue
+            core = vm.DetectionCore(model, full)
+            for run_id in sorted(test_runs):
+                rows = part[part['run_id'] == run_id]
+                alarms = simulate_run(core, rows)
+                events = label_events.get(run_id, []) if label_events is not None else chatter_events(rows, window_sec)
+                run_type = rows['run_type'].iloc[0] if 'run_type' in rows.columns else None
+                run_type = str(run_type) if run_type is not None and pd.notna(run_type) and str(run_type) else '(없음)'
+                latencies = score_run(rows, alarms, events, (overall, by_type[run_type]), trips)
+                when = (" (" + ", ".join(_seconds(a[2]) for a in alarms) + "초)") if alarms else ""
+                delay = (", 지연 " + ", ".join(f"{x:.2f}" for x in latencies) + "초") if latencies else ""
+                print(f"  {run_id}: 채터 사례 {len(events)}개, 경보 {len(alarms)}회{when}{delay}")
+    if not used_profiles:
+        sys.exit("교차 검증에는 같은 창 설정(센서 샘플링)의 실행이 2개 이상 필요합니다.")
     result = {
         'mode': 'dataset', 'dataset': _display_path(dataset_dir),
         'events_source': 'labels' if label_events is not None else 'windows',
-        'config': full, 'feature_config': dict(features.DEFAULT_FEATURE_CONFIG),
+        'config': full, 'window_profiles': used_profiles,
         'overall': overall.summary(), 'by_type': {k: v.summary() for k, v in sorted(by_type.items())},
         'by_trip': {k: v for k, v in sorted(trips.items())}, 'latencies_s': [_round(x) for x in overall.latencies],
     }
@@ -226,12 +245,18 @@ def evaluate_legacy(config):
     abnormal = [f for f in files if '이상' in os.path.basename(f)]
     data = {f: features.load_sensor_csv(f) for f in files}
     full = dict(vm.DETECTION_DEFAULTS, **config)
-    fc = features.feature_config(full)
+    base = features.feature_config(full)
+    profiles = {f: features.window_profile(data[f]['fs'], base) for f in files}  # 파일마다 샘플링으로 창 설정
 
-    def run(model, d):
+    def run(models, f):
+        """파일 f를 그 창 설정의 모델로 판정 → (경보 수, 가공 윈도우 수, 평가 간격). 그 설정의 모델이 없으면 None"""
+        model = models.get(profiles[f])
+        if model is None:
+            return None
+        fc = model['feature_config']
         core = vm.DetectionCore(model, full)
         alarms, active = 0, 0
-        for acc, t in d['segments']:
+        for acc, t in data[f]['segments']:
             core.new_cut()
             for _, feats in features.session_windows(acc, t, fc, active_only=False):
                 if feats['rms'] < fc['idle_rms_g']:
@@ -239,27 +264,35 @@ def evaluate_legacy(config):
                     continue
                 active += 1
                 alarms += core.step(feats)['decision'] == 'start'
-        return alarms, active
+        return alarms, active, fc['hop_sec']
 
     false_alarms, seconds, per_file = 0, 0.0, {}
     for f in normal:
-        model = vm.train_detector([data[g] for g in normal if g != f], full)
-        alarms, active = run(model, data[f])
+        result = run(vm.train_detectors([data[g] for g in normal if g != f], full), f)
+        if result is None:
+            print(f"  정상 {os.path.basename(f)}: 같은 창 설정의 다른 학습 파일이 없어 건너뜀")
+            continue
+        alarms, active, hop = result
         false_alarms += alarms
-        seconds += active * fc['hop_sec']
+        seconds += active * hop
         per_file[os.path.basename(f)] = alarms
         print(f"  정상 {os.path.basename(f)}: 가공 윈도우 {active}개, 경보 {alarms}회")
-    model = vm.train_detector([data[f] for f in normal], full)
+    models = vm.train_detectors([data[f] for f in normal], full)
     abnormal_result = {}
     for f in abnormal:
-        alarms, active = run(model, data[f])
+        result = run(models, f)
+        if result is None:
+            print(f"  이상 {os.path.basename(f)}: 같은 창 설정의 학습 파일이 없어 건너뜀")
+            continue
+        alarms, active, _ = result
         abnormal_result[os.path.basename(f)] = {'alarms': alarms, 'windows': active}
         print(f"  이상 {os.path.basename(f)}: 가공 윈도우 {active}개, 경보 {alarms}회")
     per_hour = false_alarms / max(seconds / 3600, 1e-9)
     print(f"정상 오경보: {false_alarms}회 / 가공 {seconds / 60:.1f}분 ({per_hour:.0f}회/시간)")
     print("주의: 예전 데이터는 이상 파일이 1개뿐이고 시각·조건 기록이 없어 참고용입니다.")
     return {
-        'mode': 'legacy', 'config': full, 'feature_config': fc,
+        'mode': 'legacy', 'config': full,
+        'window_profiles': {p: dict(features.WINDOW_PROFILES[p]) for p in sorted(set(profiles.values()))},
         'normal': {'files': len(normal), 'false_alarms': false_alarms, 'cut_minutes': round(seconds / 60, 2),
                    'false_alarms_per_hour': round(per_hour, 2), 'per_file': per_file},
         'abnormal': abnormal_result,

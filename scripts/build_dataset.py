@@ -2,8 +2,9 @@
 
 입력: data/raw/manifest.csv 와 실행마다 <run_id>_sensor.csv, <run_id>_machine.csv (화면의 '데이터 수집'으로 기록)
 출력 (data/dataset/):
-  windows.csv     윈도우(1초, 0.25초 간격)마다 특징값·절삭 조건·판정 구간 여부·라벨
-                  특징은 실시간 감지와 같은 src/features.py로 계산합니다.
+  windows.csv     윈도우마다 특징값·절삭 조건·판정 구간 여부·라벨·창 설정(profile)
+                  창은 실행의 센서 샘플링으로 정합니다: 400 Hz 이상이면 0.2초 창·0.05초 간격('fast'),
+                  아니면 1초·0.25초('legacy'). 특징은 실시간 감지와 같은 src/features.py로 계산합니다.
   runs.csv        실행마다 대표 조건(판정 구간의 중앙값)과 채터 윈도우 비율
   labels.csv      라벨 구간 원본 (실행, 라벨, 시작·끝 서버 시각) → evaluate_detector.py가 감지 지연을 구간 시작부터 잼
   ramp_limits.csv 경사 절입 시험(run_type=ramp)에서 채터가 처음 나타난 깊이 = 회전수별 안정 한계 추정값
@@ -30,7 +31,7 @@ LABEL_PRIORITY = ['chatter', 'transition', 'air']
 LABEL_COLUMNS = ['run_id', 'run_type', 'label', 'start', 'end', 'start_x', 'end_x', 'note']
 FEATURE_COLUMNS = (features.TIME_FEATURE_NAMES
                    + ['rms', 'saturation', 'fs', 'spectral', 'nonharmonic_ratio', 'peak_freq', 'peak_prominence',
-                      'spectral_entropy'])
+                      'spectral_entropy', 'rotation_hz', 'rotation_source', 'masked_fraction', 'block_rms'])
 
 
 def _num(series):
@@ -105,7 +106,9 @@ def build_run(raw_dir, run, config, overlap):
     if machine.empty or not segments:
         return [], timing
     lookup = machine_lookup(machine, config)
-    feat_config = features.feature_config(dict(config, accel_range_g=float(run.get('sensor_range_g') or config['accel_range_g'])))
+    base = features.feature_config(dict(config, accel_range_g=float(run.get('sensor_range_g') or config['accel_range_g'])))
+    rates = [fs for fs in (features.estimate_fs(seg[1]) for seg in segments) if fs]
+    feat_config = features.profile_config(base, features.window_profile(np.median(rates) if rates else None, base))
     run_start = min(_num(machine['HostTime']).min(), min(seg[2](seg[1][0]) for seg in segments))
     rows = []
     for acc, t, to_host in segments:
@@ -122,9 +125,10 @@ def build_run(raw_dir, run, config, overlap):
             label = window_label(run['labels'], host_end - feat_config['window_sec'], host_end, overlap)
             if label is None:
                 label = 'stable' if state['gate'] else 'noncut'
-            row = {'run_id': run['run_id'], 'run_type': run.get('run_type', ''), 't_host': round(host_end, 4),
+            row = {'run_id': run['run_id'], 'run_type': run.get('run_type', ''), 'profile': feat_config['profile'],
+                   't_host': round(host_end, 4),
                    't_rel': round(host_end - run_start, 3), 'gate': int(state['gate']),
-                   'transient': int(state['since_change'] < config['transient_sec']), 'label': label,
+                   'transient': int(state['since_change'] < config['transient_sec'] - 1e-6), 'label': label,
                    'n': state['n'], 'F': state['F'], 'ap': max(0.0, -state['z']) if np.isfinite(state['z']) else None,
                    'ae': _num(pd.Series([run.get('ae_mm')])).iloc[0], 'flutes': _num(pd.Series([run.get('flutes')])).iloc[0],
                    'x': state['x'], 'timing': timing}

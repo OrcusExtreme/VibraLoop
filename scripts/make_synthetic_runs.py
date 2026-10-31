@@ -23,6 +23,7 @@
 - 강제 진동: 회전 주파수 1–3차(런아웃) + 날 통과 주파수 1–4차, 크기는 절입·이송에 비례
 - 광대역 절삭 잡음, 센서 잡음 0.004 g, Y축 중력 1 g
 - 채터: 회전 고조파와 그 접힌 위치에서 15 Hz 이상 떨어진 150–480 Hz 성분
+- --rpm-error: 실제 스핀들 회전수가 지령(가공 기록의 회전수)과 다른 경우 (예: 0.02 = 2% 빠름)
 """
 import argparse
 import csv
@@ -95,14 +96,14 @@ def cut_spans(kind, cut_sec):
     return [(LEAD_SEC, LEAD_SEC + cut_sec)]
 
 
-def synthesize(spec, flutes, fs, dlpf_hz, rng):
-    """실행 하나의 센서 신호와 정답 → (t, acc[N×3], 가공 구간, 정답 dict)"""
+def synthesize(spec, flutes, fs, dlpf_hz, rng, rpm_error=0.0):
+    """실행 하나의 센서 신호와 정답 → (t, acc[N×3], 가공 구간, 정답 dict). 실제 회전수 = 지령 × (1 + rpm_error)"""
     kind, S, F, ap = spec['kind'], spec['S'], spec['F'], spec['ap']
     fs_int = fs * OVERSAMPLE
     cuts = cut_spans(kind, spec['cut_sec'])
     duration = cuts[-1][1] + LEAD_SEC
     t = np.arange(int(round(duration * fs_int))) / fs_int
-    f_rot = S / 60.0
+    f_rot = S * (1.0 + rpm_error) / 60.0
     f_tooth = f_rot * flutes
     load = (ap / 0.4) * (F / 100.0)
     engaged = np.zeros_like(t)
@@ -208,6 +209,8 @@ def main():
     parser.add_argument('--fs', type=float, default=1000.0, help="센서 출력 샘플링 (Hz)")
     parser.add_argument('--dlpf', type=float, default=184.0, help="센서 DLPF 대역폭 (Hz, MPU6050: 184 또는 260)")
     parser.add_argument('--flutes', type=int, default=2, help="공구 날 수")
+    parser.add_argument('--rpm-error', type=float, default=0.0,
+                        help="실제 회전수와 지령의 차이 비율 (예: 0.02 = 2%% 빠름, 가공 기록에는 지령값이 남음)")
     parser.add_argument('--force', action='store_true', help="출력 폴더의 예전 합성 기록을 지우고 다시 생성")
     args = parser.parse_args()
     prepare_out(args.out, args.force)
@@ -216,12 +219,12 @@ def main():
     truth_rows = []
     for index, spec in enumerate(scenario_plan(args.quick)):
         rng = np.random.default_rng([args.seed, index])
-        t, acc, cuts, truth = synthesize(spec, args.flutes, args.fs, args.dlpf, rng)
+        t, acc, cuts, truth = synthesize(spec, args.flutes, args.fs, args.dlpf, rng, args.rpm_error)
         host0 = HOST_T0 + 1000.0 * index
         meta = {'run_id': spec['run_id'], 'run_type': f"syn_{spec['kind']}", 'S_rpm': spec['S'], 'F_mm_min': spec['F'],
                 'ap_mm': spec['ap'], 'ae_mm': TOOL_D, 'tool_id': 'SYN', 'tool_diameter_mm': TOOL_D,
                 'flutes': args.flutes, 'material': 'synthetic',
-                'notes': f"synthetic seed={args.seed} dlpf={args.dlpf:g}Hz"}
+                'notes': f"synthetic seed={args.seed} dlpf={args.dlpf:g}Hz rpm_error={args.rpm_error:g}"}
         ok, message, run_id = recorder.start(meta, {'device': 'synthetic', 'fs': args.fs, 'range_g': 8})
         if not ok:
             sys.exit(message)
@@ -238,6 +241,7 @@ def main():
         recorder.stop()
         truth_rows.append({
             'run_id': run_id, 'run_type': meta['run_type'], 'S_rpm': spec['S'], 'F_mm_min': spec['F'], 'ap_mm': spec['ap'],
+            'actual_rpm': round(spec['S'] * (1.0 + args.rpm_error), 1),
             'flutes': args.flutes, 'dlpf_hz': args.dlpf, 'seed': args.seed, 'rms_x_g': round(truth['rms_x_g'], 4),
             'chatter_ratio': spec['ratio'] or '', 'chatter_hz': '' if truth['chatter_hz'] is None else round(truth['chatter_hz'], 1),
             'label_start_s': round(truth['label'][0], 3) if truth['label'] else '',

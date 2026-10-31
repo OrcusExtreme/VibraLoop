@@ -1,5 +1,9 @@
 """Benchmark: evaluate the detector on the synthetic scenarios and on the legacy training data, and print the
-results next to the stored baseline (tests/baseline/<tag>_synthetic.json, <tag>_legacy.json).
+results next to the stored baseline (tests/baseline/<tag>_synthetic.json, <tag>_stress.json, <tag>_legacy.json).
+
+Synthetic sets (same 28 scenarios, seed 1):
+  synthetic  default sensor model: DLPF 184 Hz, spindle turns at the commanded speed
+  stress     DLPF 260 Hz (more aliasing) and a spindle that turns 2 % faster than commanded
 
 Runs on a throw-away copy of the project made by run_tests.py:
   python tests/run_tests.py bench
@@ -46,17 +50,24 @@ def evaluate(kind, args):
     return proc, result, bool(extra)
 
 
-raw = os.path.join(COPY, 'data', 'synthetic', 'raw')
-dataset = os.path.join(COPY, 'data', 'synthetic', 'dataset')
-print("== synthetic scenarios (fixed seed) ==", flush=True)
-gen = script('make_synthetic_runs.py', '--out', raw)
-check("synthetic runs generated", gen.returncode == 0, (gen.stdout + gen.stderr).strip().splitlines()[-1] if gen.stdout or gen.stderr else '')
-build = script('build_dataset.py', '--raw', raw, '--out', dataset)
-check("dataset built", build.returncode == 0, (build.stdout + build.stderr).strip().splitlines()[-1] if build.stdout or build.stderr else '')
-proc, synthetic, compared = evaluate('synthetic', ['--dataset', dataset])
-check("synthetic evaluation finished with label-based events", proc.returncode == 0 and synthetic is not None
-      and synthetic['events_source'] == 'labels' and synthetic['overall']['events'] > 0)
-check(f"compared with baseline {BASELINE_TAG}_synthetic.json", compared, "" if compared else "baseline file not found")
+def last_line(proc):
+    lines = (proc.stdout + proc.stderr).strip().splitlines()
+    return lines[-1] if lines else ''
+
+
+SETS = [('synthetic', os.path.join(COPY, 'data', 'synthetic'), []),
+        ('stress', os.path.join(COPY, 'data', 'synthetic', 'stress'), ['--dlpf', '260', '--rpm-error', '0.02'])]
+for kind, folder, options in SETS:
+    raw, dataset = os.path.join(folder, 'raw'), os.path.join(folder, 'dataset')
+    print(f"== {kind} scenarios (seed 1{', ' + ' '.join(options) if options else ''}) ==", flush=True)
+    gen = script('make_synthetic_runs.py', '--out', raw, *options)
+    check(f"{kind}: runs generated", gen.returncode == 0, last_line(gen))
+    build = script('build_dataset.py', '--raw', raw, '--out', dataset)
+    check(f"{kind}: dataset built", build.returncode == 0, last_line(build))
+    proc, result, compared = evaluate(kind, ['--dataset', dataset])
+    check(f"{kind}: evaluation finished with label-based events", proc.returncode == 0 and result is not None
+          and result['events_source'] == 'labels' and result['overall']['events'] > 0)
+    check(f"{kind}: compared with baseline {BASELINE_TAG}_{kind}.json", compared, "" if compared else "baseline file not found")
 
 print("== legacy training data (data/학습 데이터) ==", flush=True)
 proc, legacy, compared = evaluate('legacy', ['--legacy'])
