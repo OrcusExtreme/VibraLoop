@@ -68,7 +68,7 @@ sequenceDiagram
     participant S as MPU6050 센서
     participant APP as 서버 (cnc_app.py)
     participant MON as 모니터 (vibration_monitor.py)
-    participant OPT as 최적화 (optimizer.py)
+    participant OPTIMIZER as 최적화 (optimizer.py)
     participant REW as 후가공 (rework.py)
     participant CNC as GRBL 머신
     participant UI as 웹 UI (script.js)
@@ -80,8 +80,8 @@ sequenceDiagram
     MON->>MON: 지표 = max(LOF, 진동 크기, 컷 기준 대비, 조건 모델, 주파수) → 1초 연속 초과면 경보
 
     Note over MON,CNC: [1단계: 온라인 대응]
-    MON->>OPT: 현재 조건(S, F, 깊이)·채터 주파수
-    OPT-->>MON: 제안 (기본 규칙: 회전수 +10%, 이송 -20%)
+    MON->>OPTIMIZER: 현재 조건(S, F, 깊이)·채터 주파수
+    OPTIMIZER-->>MON: 제안 (기본 규칙: 회전수 +10%, 이송 -20%)
     MON->>CNC: 스핀들·이송 오버라이드 실시간 명령
     APP->>APP: data/Vibration_detection.csv에 감지 기록 (Action=mitigate)
     MON->>UI: 이상 진동 알림, 실시간 지표 표시
@@ -93,7 +93,7 @@ sequenceDiagram
 
     Note over MON,REW: [3단계: 재가공 G-code 생성]
     APP->>CNC: 상태 확인 ($X)
-    MON->>OPT: 감지 시점 조건 → 제안 (채터 확률 모델 / 채터 주파수 / 기본 규칙)
+    MON->>OPTIMIZER: 감지 시점 조건 → 제안 (채터 확률 모델 / 채터 주파수 / 기본 규칙)
     MON->>REW: 원본 NC 코드 + 제안 조건 + 깊이 분할 수 + 허용 공차(Z_tol)
     REW->>REW: 깊이를 나눈 패스(예: 1/2 → 전체 깊이) + 공차 패스(Z - tol), 안전높이 Z5 진입
     REW->>APP: nc/rework.nc 파일 저장 완료

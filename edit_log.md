@@ -14,6 +14,15 @@
 
 ---
 
+## 2026-10-31 — GitHub Markdown 렌더링 오류 수정 (README.md Mermaid sequenceDiagram)
+
+- 작업자: Antigravity (요청: GitHub README sequenceDiagram 렌더링 오류 "Parse error on line 18: Expecting 'link', '+', '-', '0', 'ACTOR', got 'opt'" 해결)
+- 원인: Mermaid sequenceDiagram에서 `OPT`가 예약어 `opt`(optional fragment)와 대소문자 무관하게 충돌하여 actor 파싱 오류 발생
+- 수정:
+  - `README.md`: participant `OPT`를 `OPTIMIZER`로 변경하여 예약어 충돌 해소
+
+---
+
 ## 2026-10-31 — 이상 진동 감지·대응 재설계, 데이터 수집 체계 (edit_analysis.md 반영)
 
 - 작업자: Claude Code (요청: "이 내용을 edit_analysis.md로 저장하고 4번의 1단계부터 코드로 반영 시작. 또한 제안한 아이디어 대로 모두 수정하고 이를 edit_log.md에 반영")
