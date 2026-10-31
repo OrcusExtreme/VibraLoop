@@ -717,35 +717,40 @@ input:checked + .toggle-slider:before {
     padding-top: 1vh;
 }
 
-.alert-modal {
-    max-width: 500px;
+/* 진동 감지 모델 관리 창: 학습 파일 이름이 길어 기본 모달보다 넓게 */
+.vibration-modal-content {
+    width: 560px;
 }
 
-.alert-header {
-    background-color: var(--emergency-color);
-    color: white;
+.model-status {
+    white-space: pre-line;
+    line-height: 1.5;
+    font-size: clamp(0.75rem, 0.9vw, 0.9rem);
 }
 
-#recovery-message {
+.model-status.untrained {
+    color: var(--warning-color);
+}
+
+.model-file-list {
     margin-top: 1vh;
-    font-weight: bold;
-}
-
-#alert-position {
+    max-height: 15vh;
+    overflow-y: auto;
     font-family: monospace;
-    background-color: #f0f0f0;
-    padding: 1vh;
-    border-radius: 5px;
+    font-size: clamp(0.65rem, 0.75vw, 0.75rem);
+    white-space: pre-line;
+    background-color: rgba(0, 0, 0, 0.2);
+    border-radius: 4px;
+    padding: 0.5vh 0.5vw;
 }
 
-/* 실행 버튼 강조 */
-#execute-recovery-btn {
-    background-color: var(--accent-color);
-    color: white;
-    font-weight: bold;
-    display: flex;
-    justify-content: center;
-    align-items: center;
+.model-file-list:empty {
+    display: none;
+}
+
+.modal button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* 모달 내부 모든 버튼에 중앙 정렬 적용 */
@@ -801,6 +806,89 @@ input:checked + .toggle-slider:before {
     text-overflow: ellipsis;
 }
 
+#vibration-status-text.untrained {
+    color: var(--warning-color);
+}
+
+/* 실시간 진동 지표 (1 이상이면 기준 초과) */
+.vibration-live {
+    margin-left: 0.4vw;
+    font-size: clamp(0.6rem, 0.7vw, 0.7rem);
+    white-space: nowrap;
+    opacity: 0.85;
+}
+
+.vibration-live.warn {
+    color: var(--warning-color);
+    opacity: 1;
+}
+
+.vibration-live.alarm {
+    color: var(--emergency-color);
+    font-weight: bold;
+    opacity: 1;
+}
+
+#recording-btn.active {
+    background-color: var(--emergency-color);
+}
+
+#sensor-baud-select {
+    max-width: 7.5em;
+}
+
+/* 데이터 수집 창 */
+.modal-help {
+    font-size: clamp(0.65rem, 0.8vw, 0.8rem);
+    line-height: 1.5;
+    opacity: 0.85;
+    margin: 1vh 0;
+}
+
+.recording-form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.8vh 1vw;
+}
+
+.modal-body .recording-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3vh;
+    margin: 0;
+    font-size: clamp(0.65rem, 0.8vw, 0.8rem);
+}
+
+.modal-body .recording-form input {
+    padding: 0.5vh 0.5vw;
+}
+
+.recording-label-row,
+.setting-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5vw;
+    margin-top: 1vh;
+}
+
+.modal-body .recording-label-row label,
+.modal-body .setting-row label {
+    margin: 0;
+}
+
+.modal-body input[type="checkbox"] {
+    width: auto;
+    margin: 0.2vh 0.4vw 0 0;
+}
+
+.modal-body .checkbox-label {
+    display: flex;
+    align-items: flex-start;
+    font-weight: normal;
+    line-height: 1.4;
+}
+
 /* 이상 진동 버튼 컨테이너 */
 .vibration-buttons {
     display: flex;
@@ -816,6 +904,7 @@ input:checked + .toggle-slider:before {
     min-height: 20px;
     flex: 1; /* 버튼이 균등한 너비를 갖도록 설정 */
     background-color: var(--accent-color);
+    white-space: nowrap;
 }
 
 #vibration-toggle-btn.active {

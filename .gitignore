@@ -3,11 +3,24 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Virtual Environment
+# Virtual Environment (setup.bat / setup.sh creates .venv on each PC; never copy it between PCs)
+.venv/
 venv/
 env/
 ENV/
 *.venv
+
+# Offline installation files downloaded by setup --download-wheels
+wheels/
+
+# Old-format detection log kept by vibration_monitor.append_detection_record
+data/*.old
+
+# Data collection recordings and derived datasets (large; back them up outside Git)
+data/raw/
+data/dataset/
+# Per-PC detector settings saved from the model window
+data/detector_settings.json
 
 # Runtime logs
 logs/*.csv

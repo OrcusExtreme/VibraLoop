@@ -23,6 +23,8 @@ FIXED_SPINDLE = None
 MAX_TOLERANCE_MM = 1.0
 # 수동 재가공(/make_rework, make_rework 이벤트) 시 고정 스핀들 속도 (기존 동작 유지)
 MANUAL_REWORK_SPINDLE = 23000
+# 진동 감지 모델 관리 창에서 올릴 수 있는 학습 CSV 최대 크기 (100Hz 기준 약 2시간 분량)
+MAX_TRAINING_UPLOAD_BYTES = 50 * 1024 * 1024
 # 클라이언트 명령 → GRBL 1.1 실시간 Spindle Override 바이트
 SPINDLE_OVERRIDE_COMMANDS = {
     '0x99': (b'\x99', "Spindle Override Reset"),
@@ -188,9 +190,10 @@ def init_routes(app, socketio, controllers):
             return {"status": "error", "message": "센서 포트를 선택해주세요"}
         
         port = data['port']
-        
+        baud = data.get('baud')  # 115200: 기존 JSON 펌웨어, 500000: 고속 펌웨어(MPU6050_fast)
+
         # connect_arduino 함수 호출하여 연결 시도
-        if controllers.connect_arduino(port):
+        if controllers.connect_arduino(port, baud):
             return {"status": "success", "message": f"센서가 {port}에 성공적으로 연결되었습니다."}
         else:
             return {"status": "error", "message": f"센서 포트 {port} 연결 실패"}
@@ -252,9 +255,12 @@ def init_routes(app, socketio, controllers):
             line_count = result['lines']
             current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
-            # 파일명 정보 추가 (전달된 경우)
+            # 파일명 정보 추가 (전달된 경우, 데이터 수집 기록의 program 기본값)
             file_name = data.get('fileName', 'unknown.nc')
-            
+            controllers.program_name = file_name
+            if controllers.program_meta:
+                socketio.emit('log_update', {"message": f"실험 조건(META): {controllers.program_meta}", "color": "blue"})
+
             # 로그 메시지 구성
             log_message = f"[{current_time}] NC 코드 로드 '{file_name}': {line_count}줄, {file_size} 바이트"
             socketio.emit('log_update', {"message": log_message, "color": "green"})
@@ -999,8 +1005,86 @@ def init_routes(app, socketio, controllers):
         try:
             ok, message = controllers.start_rework_job()
             return {"status": "success" if ok else "error", "message": message}
-            
+
         except Exception as e:
             error_msg = f"rework.nc 처리 중 오류: {str(e)}"
             socketio.emit('log_update', {"message": error_msg, "color": "red"})
             return {"status": "error", "message": error_msg}
+
+    # 이상 진동 감지 모델 관리 (제어 영역의 '진동 감지 모델' 창)
+    def vibration_model_change_error():
+        """모델을 바꿀 수 없는 상태면 그 이유를, 바꿀 수 있으면 None을 반환합니다."""
+        if controllers.vibration_monitor is None:
+            return '진동 감지기를 준비하는 중입니다. 잠시 후 다시 시도하세요.'
+        if controllers.job_active or controllers.state in ("running", "paused") or controllers.vibration_detection_active:
+            return '가공 중에는 진동 감지 모델을 바꿀 수 없습니다. 가공을 마친 뒤 다시 시도하세요.'
+        return None
+
+    @app.route('/api/vibration/model')
+    def api_vibration_model():
+        """진동 감지 모델의 학습 상태 (서버 시작 직후 학습 중이면 status='loading')"""
+        monitor = controllers.vibration_monitor
+        if monitor is None:
+            return jsonify({'status': 'loading', 'message': '진동 감지기를 준비하는 중입니다.'})
+        return jsonify({'status': 'success', 'model': monitor.get_status()})
+
+    @app.route('/api/vibration/train', methods=['POST'])
+    def api_vibration_train():
+        """정상 가공 센서 CSV(train_file)를 학습 데이터에 추가하고 모델을 다시 학습합니다."""
+        error = vibration_model_change_error()
+        if error:
+            return jsonify({'status': 'error', 'message': error})
+        file = request.files.get('train_file')
+        if file is None or not file.filename:
+            return jsonify({'status': 'error', 'message': '학습할 CSV 파일을 선택하세요.'})
+        content = file.read(MAX_TRAINING_UPLOAD_BYTES + 1)
+        if len(content) > MAX_TRAINING_UPLOAD_BYTES:
+            return jsonify({'status': 'error', 'message': f'파일이 너무 큽니다 (최대 {MAX_TRAINING_UPLOAD_BYTES // (1024 * 1024)}MB).'})
+
+        monitor = controllers.vibration_monitor
+        ok, message = monitor.add_training_file(file.filename, content)
+        socketio.emit('log_update', {"message": f"진동 감지 모델: {message}", "color": "green" if ok else "red"})
+        return jsonify({'status': 'success' if ok else 'error', 'message': message, 'model': monitor.get_status()})
+
+    @app.route('/api/vibration/reset', methods=['POST'])
+    def api_vibration_reset():
+        """학습 데이터 폴더의 파일로 모델을 다시 학습하고 감지 상태를 초기화합니다."""
+        error = vibration_model_change_error()
+        if error:
+            return jsonify({'status': 'error', 'message': error})
+        monitor = controllers.vibration_monitor
+        ok, message = monitor.reset_analyzer()
+        socketio.emit('log_update', {"message": f"진동 감지 모델: {message}", "color": "green" if ok else "red"})
+        return jsonify({'status': 'success' if ok else 'error', 'message': message, 'model': monitor.get_status()})
+
+    @app.route('/api/vibration/settings', methods=['POST'])
+    def api_vibration_settings():
+        """감지 설정 변경: mitigation_enabled(온라인 대응), decision_mode('k_of_n' 또는 'cusum'). 가공 중에도 다음 판정부터 적용."""
+        monitor = controllers.vibration_monitor
+        if monitor is None:
+            return jsonify({'status': 'error', 'message': '진동 감지기를 준비하는 중입니다. 잠시 후 다시 시도하세요.'})
+        ok, message = monitor.update_settings(request.get_json(silent=True) or {})
+        if ok:
+            socketio.emit('log_update', {"message": f"진동 감지 설정 변경: {monitor.get_status()['settings']}", "color": "blue"})
+        return jsonify({'status': 'success' if ok else 'error', 'message': message, 'model': monitor.get_status()})
+
+    # 데이터 수집 기록 (제어 영역의 '데이터 수집' 창, data/raw/에 저장)
+    @app.route('/api/recording/status')
+    def api_recording_status():
+        return jsonify({'status': 'success', 'recording': controllers.recording_status()})
+
+    @app.route('/api/recording/start', methods=['POST'])
+    def api_recording_start():
+        ok, message = controllers.start_recording(request.get_json(silent=True) or {})
+        return jsonify({'status': 'success' if ok else 'error', 'message': message, 'recording': controllers.recording_status()})
+
+    @app.route('/api/recording/mark', methods=['POST'])
+    def api_recording_mark():
+        data = request.get_json(silent=True) or {}
+        ok, message = controllers.mark_recording(data.get('label', 'chatter'), data.get('edge'), data.get('note', ''))
+        return jsonify({'status': 'success' if ok else 'error', 'message': message, 'recording': controllers.recording_status()})
+
+    @app.route('/api/recording/stop', methods=['POST'])
+    def api_recording_stop():
+        ok, message = controllers.stop_recording()
+        return jsonify({'status': 'success' if ok else 'error', 'message': message, 'recording': controllers.recording_status()})

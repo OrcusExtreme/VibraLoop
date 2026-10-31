@@ -6,8 +6,12 @@ arduino_sensor.py의 수정된 동작을 테스트하기 위한 스크립트
 """
 
 import subprocess
+import sys
 import time
 import os
+
+# 이 스크립트를 실행한 파이썬(가상환경 포함)으로 센서 스크립트를 실행
+SENSOR_SCRIPT = [sys.executable, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "arduino_sensor.py")]
 
 def run_test():
     """
@@ -25,8 +29,8 @@ def run_test():
     print("-" * 70)
     
     process = subprocess.Popen(
-        ["python", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "arduino_sensor.py")], 
-        stdout=subprocess.PIPE, 
+        SENSOR_SCRIPT,
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding='utf-8'
@@ -46,8 +50,8 @@ def run_test():
     print("-" * 70)
     
     process = subprocess.Popen(
-        ["python", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "arduino_sensor.py"), "--port", "COM99"], 
-        stdout=subprocess.PIPE, 
+        SENSOR_SCRIPT + ["--port", "COM99"],
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding='utf-8'

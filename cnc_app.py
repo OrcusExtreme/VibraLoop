@@ -21,6 +21,8 @@ from gcode_utils import ModalState, code_numbers, parse_words, strip_comments
 from vibration_monitor import VibrationMonitor
 import logging
 from watcher import start_rework_watcher  # watcher.py의 rework.nc 감시 함수
+from sensor_protocol import SensorStream, parse_legacy_line
+from data_recorder import RunRecorder
 
 # Flask 앱 설정
 app = Flask(
@@ -49,9 +51,19 @@ tolerance_value = 0.0
 # 아두이노 센서 데이터 관련 변수
 ARDUINO_SERIAL_PORT = None  # 기본 포트 없음 - 자동 감지로 변경
 ARDUINO_BAUD_RATE = 115200
+SENSOR_BAUD_RATES = (115200, 500000, 1000000)  # 115200: 기존 JSON 펌웨어(MPU6050), 500000: 고속 펌웨어(MPU6050_fast)
+SENSOR_UI_EMIT_INTERVAL = 0.05  # 센서 값을 화면에 보내는 간격 (초): 고속 센서도 화면에는 초당 20번만 표시
 arduino_serial = None
 latest_arduino_data = "센서 데이터 없음"
 arduino_connected = False
+sensor_stream = None  # 현재 센서 연결의 해석기 (샘플링·측정 범위·누락 집계)
+run_recorder = RunRecorder(os.path.join(BASE_DIR, 'data', 'raw'))  # 데이터 수집 기록 (data/raw/)
+
+# 공구·프로그램 정보 (판정 구간의 회전 주파수 고조파, 채터 주파수 기반 회전수 선정, 데이터 기록에 사용)
+tool_diameter = None  # 공구 지름 (mm)
+tool_flutes = None    # 공구 날 수
+program_name = None   # 마지막으로 불러온 NC 파일 이름
+program_meta = {}     # NC 파일의 (META key=value ...) 주석 (scripts/make_experiment_nc.py가 작성)
 
 # 가공 상태 관련 변수
 state = "idle"  # idle, running, paused, emergency, alarm_unlocked, alarm
@@ -88,6 +100,12 @@ RAPID_FEEDRATE = 5000         # 급속 이송(G0) 속도 추정값 (mm/min, 예�
 rework_armed_at = None
 REWORK_ARM_TIMEOUT = 30.0  # 초
 
+# 위치를 유지하는 정지 (피드 홀드 → Hold:0 → 스핀들 정지 → 리셋): 스트리밍 스레드가 순서를 진행
+safe_stop_request = None
+SAFE_STOP_TIMEOUT = 5.0  # Hold:0을 기다리는 최대 시간 (초), 넘으면 바로 리셋
+last_grbl_status = {}    # 마지막 GRBL 상태 보고 (판정 구간·데이터 기록용)
+last_grbl_status_time = 0.0
+
 # CSV 로깅 관련 변수
 csv_file = None
 csv_writer = None
@@ -97,7 +115,7 @@ last_job_elapsed = 0
 # 알람 상태 관련 변수
 last_alarm_check = 0
 last_alarm_message = ""
-alarm_check_interval = 3.0  # 알람 확인 간격(초)
+alarm_check_interval = 3.0  # 컨트롤러 상태(알람·연결) 확인 간격(초)
 alarm_retry_count = 0
 max_alarm_retries = 3
 
@@ -142,13 +160,11 @@ def start_vibration_detection(reset_buffer=True):
     logger.info("[vibration] 진동 탐지 시작")
     vibration_detection_active = True
     
-    # 진동 모니터 초기화
+    # 진동 모니터 초기화 (새 가공이면 버퍼·판정 상태를 비움)
     monitor = get_vibration_monitor()
     if reset_buffer:
-        monitor.sensor_data_buffer = []
-        monitor.abnormal_vibration_start_time = None
-        monitor.abnormal_count = 0
-    
+        monitor.reset_stream()
+
     if state == "running":
         monitor.is_running = True # 진동 모니터링 시작
 
@@ -183,8 +199,8 @@ def list_serial_ports():
     except Exception as e:
         return []
 
-# GRBL 상태 보고 파싱
-STATE_RE = re.compile(r'^<([A-Za-z]+)')
+# GRBL 상태 보고 파싱 (Hold:0 = 피드 홀드 완료, Hold:1 = 감속 중)
+STATE_RE = re.compile(r'^<([A-Za-z]+)(?::(\d+))?')
 POSITION_RES = {key: re.compile(key + r':([-\d.]+),([-\d.]+),([-\d.]+)') for key in ('MPos', 'WPos', 'WCO')}
 FS_RE = re.compile(r'FS:([-\d.]+),([-\d.]+)')
 OV_RE = re.compile(r'Ov:(\d+),(\d+),(\d+)')
@@ -192,13 +208,16 @@ OV_RE = re.compile(r'Ov:(\d+),(\d+),(\d+)')
 def parse_status_report(line):
     """GRBL 상태 보고를 dict로 변환합니다. 예: <Run|MPos:1.000,2.000,0.000|FS:500,8000|WCO:0.000,0.000,0.000>
 
-    반환: {'state': 'Run', 'work': (x, y, z), 'MPos': ..., 'feed': .., 'spindle': .., 'ov': (feed%, rapid%, spindle%)}
+    반환: {'state': 'Run', 'substate': 0(Hold:0일 때만), 'work': (x, y, z), 'MPos': ..., 'feed': .., 'spindle': ..,
+           'ov': (feed%, rapid%, spindle%)}
     """
     global grbl_wco
     match = STATE_RE.match(line.strip())
     if not match:
         return None
     status = {'state': match.group(1)}
+    if match.group(2) is not None:
+        status['substate'] = int(match.group(2))
     for key, regex in POSITION_RES.items():
         pos_match = regex.search(line)
         if pos_match:
@@ -217,6 +236,35 @@ def parse_status_report(line):
     if ov_match:
         status['ov'] = tuple(int(v) for v in ov_match.groups())
     return status
+
+def machine_snapshot():
+    """진동 감지(판정 구간)와 데이터 기록에 쓰는 현재 기계 상태."""
+    status = last_grbl_status or {}
+    n_eff, F_eff = effective_cutting_conditions()
+    x, y, z = status.get('work') or (x_vals[-1], y_vals[-1], z_vals[-1])
+    flutes = tool_flutes
+    if not flutes and program_meta.get('flutes'):
+        try:
+            flutes = int(float(program_meta['flutes']))
+        except ValueError:
+            flutes = None
+    return {
+        'time': time.time(), 'state': state, 'grbl_state': status.get('state'), 'substate': status.get('substate'),
+        'x': x, 'y': y, 'z': z,
+        'n_cmd': current_spindle, 'F_cmd': current_feedrate,
+        'spindle_override': spindle_override, 'feed_override': feed_override,
+        'n_eff': n_eff, 'F_eff': F_eff,
+        'feed_rt': status.get('feed'), 'spindle_rt': status.get('spindle'),
+        'line': gcode_current_idx, 'flutes': flutes,
+    }
+
+def _remember_status(status):
+    """마지막 GRBL 상태를 저장하고, 데이터 수집 중이면 가공 로그에 한 줄 남깁니다."""
+    global last_grbl_status, last_grbl_status_time
+    last_grbl_status = status
+    last_grbl_status_time = time.time()
+    if run_recorder.active:
+        run_recorder.add_machine(machine_snapshot())
 
 def query_status(timeout=1.0):
     """GRBL에 '?'를 보내 상태 보고를 받아 dict로 반환합니다. (가공 스트리밍 중에는 스트리밍 스레드만 사용)"""
@@ -388,77 +436,84 @@ def disconnect_serial():
     return {"status": "info", "message": "연결된 컨트롤러가 없습니다"}
 
 def _sensor_dict(ax, ay, az, gx=None, gy=None, gz=None):
-    """센서 값을 {'accel': {...}, 'gyro': {...}} 표준 형식으로 변환합니다."""
+    """센서 값을 {'accel': {...}, 'gyro': {...}} 표준 형식으로 변환합니다 (자이로가 없는 센서는 None)."""
     def num(value):
-        return float(value) if value is not None else 0.0
+        return float(value) if value is not None else None
     return {
         'accel': {'x': num(ax), 'y': num(ay), 'z': num(az)},
         'gyro': {'x': num(gx), 'y': num(gy), 'z': num(gz)}
     }
 
 def parse_sensor_line(line):
-    """센서 한 줄을 표준 형식으로 변환합니다. 해석할 수 없으면 None을 반환합니다.
+    """기존 형식 센서 한 줄을 표준 형식으로 변환합니다. 해석할 수 없으면 None을 반환합니다.
 
-    지원 형식:
+    지원 형식 (고속 펌웨어 형식은 src/sensor_protocol.py의 SensorStream이 해석):
       - {"accel": {"x","y","z"}, "gyro": {"x","y","z"}}   (arduino/MPU6050 펌웨어)
       - {"accelX", "accelY", "accelZ", ...}                (arduino_example/sensor_example.ino, src/arduino_sensor.py)
       - {"x", "y", "z"}                                    (단순 3축)
       - "x: 5319 y: 5824 z: 2801"                          (텍스트)
     """
-    try:
-        data = json.loads(line)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        gyro = data.get('gyro') if isinstance(data.get('gyro'), dict) else {}
-        if isinstance(data.get('accel'), dict):
-            accel = data['accel']
-            return _sensor_dict(accel.get('x'), accel.get('y'), accel.get('z'), gyro.get('x'), gyro.get('y'), gyro.get('z'))
-        if all(key in data for key in ('accelX', 'accelY', 'accelZ')):
-            return _sensor_dict(data['accelX'], data['accelY'], data['accelZ'], data.get('gyroX'), data.get('gyroY'), data.get('gyroZ'))
-        if all(key in data for key in ('x', 'y', 'z')):
-            return _sensor_dict(data['x'], data['y'], data['z'], gyro.get('x'), gyro.get('y'), gyro.get('z'))
+    parsed = parse_legacy_line(line)
+    if parsed is None:
         return None
-    # JSON이 아닌 경우 텍스트 형식 파싱 시도 (예: "x: 5319 y: 5824 z: 2801")
-    text_match = re.match(r'x:\s*(-?\d+(?:\.\d+)?)\s+y:\s*(-?\d+(?:\.\d+)?)\s+z:\s*(-?\d+(?:\.\d+)?)', line, re.IGNORECASE)
-    if text_match:
-        return _sensor_dict(*text_match.groups())
-    return None
+    return _sensor_dict(*parsed[:6])
 
 # 아두이노 센서 데이터 읽기 함수
 def read_arduino_serial():
-    """아두이노 시리얼 연결을 통해 센서 데이터를 주기적으로 읽는 함수"""
-    global latest_arduino_data, arduino_serial, arduino_connected, ARDUINO_SERIAL_PORT
+    """센서 수신 스레드: 도착한 줄을 모아 해석하고 진동 감지·데이터 기록에 넘깁니다.
 
+    고속 센서(1 kHz 이상)도 처리할 수 있도록 도착한 줄을 묶음으로 처리하고,
+    화면에는 SENSOR_UI_EMIT_INTERVAL마다 마지막 값만 보냅니다 (전체 데이터는 데이터 수집 기록으로 서버에 저장).
+    진동 감지에는 장치 측정 시각(일련번호·장치 ms)이 있으면 그것을, 없으면 서버 수신 시각을 넘깁니다.
+    """
+    global latest_arduino_data, arduino_serial, arduino_connected, ARDUINO_SERIAL_PORT, sensor_stream
+
+    rx = bytearray()
+    last_ui_emit = 0.0
     while True:
         # 연결이 활성화된 경우에만 데이터 읽기 시도
         if arduino_serial and arduino_serial.is_open:
             try:
-                # 데이터 읽기
-                if arduino_serial.in_waiting > 0:
-                    line = arduino_serial.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        try:
-                            data = parse_sensor_line(line)
-                        except (TypeError, ValueError):
-                            data = None
+                waiting = arduino_serial.in_waiting
+                if not waiting:
+                    time.sleep(0.002)
+                    continue
+                rx.extend(arduino_serial.read(waiting))
+                now = time.time()
+                if sensor_stream is None:
+                    sensor_stream = SensorStream()
+                stream = sensor_stream
+                samples = []
+                while b'\n' in rx:
+                    raw, _, rest = rx.partition(b'\n')
+                    rx[:] = rest
+                    new_samples, message = stream.parse_line(raw.decode('utf-8', errors='ignore'), now)
+                    samples.extend(new_samples)
+                    if message:
+                        # 해석할 수 없는 줄(펌웨어 초기화 메시지 등)과 센서 상태 안내는 그대로 표시
+                        latest_arduino_data = message
+                        socketio.emit('log_update', {"message": message, "color": "sensor"})
+                if len(rx) > 65536:  # 줄바꿈 없이 쌓이는 데이터 (보레이트 불일치 등)
+                    rx.clear()
+                if samples:
+                    monitor = vibration_monitor
+                    if monitor is not None:
+                        info = stream.describe()
+                        if any(monitor.sensor_info.get(key) != info[key] for key in ('device', 'fs', 'range_g')):
+                            monitor.set_sensor_info(info)
+                        use_device_time = all(s.device_time is not None for s in samples)
+                        monitor.process_sensor_data([[s.ax, s.ay, s.az] for s in samples],
+                                                    [s.device_time if use_device_time else s.host_time for s in samples])
+                    if run_recorder.active:
+                        run_recorder.add_sensor(samples)
+                    if now - last_ui_emit >= SENSOR_UI_EMIT_INTERVAL:
+                        last_ui_emit = now
+                        last = samples[-1]
+                        latest_arduino_data = json.dumps(_sensor_dict(last.ax, last.ay, last.az, last.gx, last.gy, last.gz))
+                        socketio.emit('arduino_data', {'data': latest_arduino_data})
 
-                        if data is not None:
-                            latest_arduino_data = json.dumps(data)
-                            # 클라이언트는 arduino_data 하나로 센서 로그 표시와 센서 데이터 저장을 모두 처리
-                            socketio.emit('arduino_data', {'data': latest_arduino_data})
-                            
-                            # 진동 분석을 위한 데이터 처리
-                            if vibration_monitor is not None:
-                                acc = data['accel']
-                                vibration_monitor.process_sensor_data([[acc['x'], acc['y'], acc['z']]])  # 2D 배열로 전달
-                        else:
-                            # 파싱할 수 없는 형식(펌웨어 초기화 메시지 등)은 그대로 표시
-                            latest_arduino_data = line
-                            socketio.emit('log_update', {"message": f"[센서] {line}", "color": "sensor"})
-                
-                # 짧은 대기 시간
-                time.sleep(0.0005)
+                # 짧게 쉬어 다음 줄들을 묶어서 처리
+                time.sleep(0.001)
             except serial.SerialException as se:
                 # 시리얼 통신 오류 처리
                 error_msg = str(se)
@@ -489,13 +544,23 @@ def read_arduino_serial():
             time.sleep(0.5)
 
 # connect_arduino 함수 수정 - 특정 포트에 연결
-def connect_arduino(port=None):
-    """특정 아두이노 센서 포트에 연결합니다. 포트가 명시적으로 지정된 경우에만 연결을 시도합니다."""
-    global arduino_serial, arduino_connected, ARDUINO_SERIAL_PORT
-    
+def connect_arduino(port=None, baud=None):
+    """특정 아두이노 센서 포트에 연결합니다. 포트가 명시적으로 지정된 경우에만 연결을 시도합니다.
+
+    baud: 115200(기존 JSON 펌웨어 arduino/MPU6050) 또는 500000(고속 펌웨어 arduino/MPU6050_fast)
+    """
+    global arduino_serial, arduino_connected, ARDUINO_SERIAL_PORT, ARDUINO_BAUD_RATE, sensor_stream
+
     # 포트가 지정되지 않은 경우 연결 시도하지 않음
     if not port:
         socketio.emit('log_update', {"message": "연결할 포트가 지정되지 않았습니다. 포트를 선택해주세요.", "color": "orange"})
+        return False
+    try:
+        baud = int(baud) if baud else ARDUINO_BAUD_RATE
+    except (TypeError, ValueError):
+        baud = None
+    if baud not in SENSOR_BAUD_RATES:
+        socketio.emit('log_update', {"message": f"지원하지 않는 센서 통신 속도입니다: {baud} (가능: {', '.join(map(str, SENSOR_BAUD_RATES))})", "color": "red"})
         return False
     
     # 이미 연결되어 있으면 해제
@@ -513,9 +578,10 @@ def connect_arduino(port=None):
         socketio.emit('log_update', {"message": f"센서 포트 {port}에 연결 시도 중...", "color": "blue"})
         
         # 명시적으로 지정된 포트에만 시리얼 포트 연결 시도
+        sensor_stream = SensorStream()
         arduino_serial = serial.Serial(
             port=port,
-            baudrate=ARDUINO_BAUD_RATE,
+            baudrate=baud,
             timeout=1,
             write_timeout=1
         )
@@ -529,9 +595,10 @@ def connect_arduino(port=None):
         
         # 연결 성공 처리
         ARDUINO_SERIAL_PORT = port
+        ARDUINO_BAUD_RATE = baud
         arduino_connected = True
         socketio.emit('arduino_status', {'connected': True, 'port': port})
-        socketio.emit('log_update', {"message": f"센서가 {port}에 성공적으로 연결되었습니다.", "color": "green"})
+        socketio.emit('log_update', {"message": f"센서가 {port}({baud} bps)에 성공적으로 연결되었습니다.", "color": "green"})
         
         return True
         
@@ -573,14 +640,26 @@ def connect_arduino(port=None):
 # GRBL에서 지원하지 않는 M 코드 (필요시 추가)
 UNSUPPORTED_M_CODES = {0, 1, 6, 7, 9, 30, 48, 49, 60}
 M_WORD_RE = re.compile(r'M\s*0*(\d+)(?![\d.])', re.IGNORECASE)
+META_RE = re.compile(r'\(\s*META\s+([^)]*)\)', re.IGNORECASE)
+
+def parse_program_meta(file_content):
+    """NC 파일의 (META key=value ...) 주석을 dict로 읽습니다 (scripts/make_experiment_nc.py가 실험 조건을 기록)."""
+    meta = {}
+    for match in META_RE.finditer(file_content or ''):
+        for item in match.group(1).split():
+            if '=' in item:
+                key, value = item.split('=', 1)
+                meta[key.strip()] = value.strip()
+    return meta
 
 # NC 코드 파일을 불러오는 함수
 def load_nc_code(file_content, is_rework=False):
     """NC 코드 파일 내용을 파싱하고 가공 경로를 초기화합니다.
 
-    is_rework=False(사용자가 불러온 NC 코드)이면 재가공 경로 생성의 기준 코드로도 저장합니다.
+    is_rework=False(사용자가 불러온 NC 코드)이면 재가공 경로 생성의 기준 코드로도 저장하고,
+    (META ...) 주석의 실험 조건을 데이터 수집 기록의 기본값으로 저장합니다.
     """
-    global gcode_lines, rework_source_lines
+    global gcode_lines, rework_source_lines, program_meta
     try:
         raw_lines = file_content.split('\n')
         new_lines = []
@@ -613,6 +692,7 @@ def load_nc_code(file_content, is_rework=False):
         gcode_lines = new_lines
         if not is_rework:
             rework_source_lines = list(new_lines)
+            program_meta = parse_program_meta(file_content)
         # NC 코드 로드 관련 로그 기록 추가
         current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_message = f"[{current_time}] NC 코드 로드 완료: 총 {len(gcode_lines)}개 라인"
@@ -687,9 +767,11 @@ def start_csv_logging():
     csv_file = open(filename, 'w', newline='', encoding='utf-8')
     csv_writer = csv.writer(csv_file)
     
-    # 헤더 작성 - 클라이언트 저장 방식과 동일하게 설정
-    csv_writer.writerow(['X', 'Y', 'Z', 'ProcessTime'])
-    
+    # 헤더 작성 - 앞 4개 열은 클라이언트 저장 방식과 동일. Time(epoch 초)은 센서 기록(HostTime)과 같은 시계라
+    # 두 파일을 시간으로 맞출 수 있음. Line은 GRBL로 보낸 줄 수 (GRBL 버퍼 때문에 실행 중인 줄과 몇 줄 차이 날 수 있음)
+    csv_writer.writerow(['X', 'Y', 'Z', 'ProcessTime', 'Time', 'GrblState', 'SpindleRPM', 'FeedRate',
+                         'SpindleOverride', 'FeedOverride', 'Line'])
+
     return filename
 
 # CSV 로깅 종료
@@ -703,124 +785,139 @@ def stop_csv_logging():
 
 # 가공 데이터 로깅
 def log_process_data():
-    """현재 좌표와 가공 경과 시간(초)을 CSV에 기록합니다."""
+    """현재 좌표, 가공 경과 시간, 시각, GRBL 상태, 실제 절삭 조건을 CSV에 기록합니다."""
     if not csv_writer:
         return
 
-    elapsed_sec = time.time() - process_start_time if process_start_time else 0
+    now = time.time()
+    elapsed_sec = now - process_start_time if process_start_time else 0
 
     current_x = x_vals[-1] if x_vals else 0
     current_y = y_vals[-1] if y_vals else 0
     current_z = z_vals[-1] if z_vals else 0
+    n_eff, F_eff = effective_cutting_conditions()
 
     csv_writer.writerow([
         f"{current_x:.4f}",
         f"{current_y:.4f}",
         f"{current_z:.4f}",
-        int(round(elapsed_sec))
+        f"{elapsed_sec:.3f}",
+        f"{now:.3f}",
+        (last_grbl_status or {}).get('state', ''),
+        "" if n_eff is None else f"{n_eff:.0f}",
+        "" if F_eff is None else f"{F_eff:.1f}",
+        spindle_override,
+        feed_override,
+        gcode_current_idx,
     ])
 
-# 알람 상태 체크 (주기적)
-def check_alarm():
-    """주기적으로 CNC 컨트롤러의 알람 상태를 확인합니다."""
-    global ser, state, last_alarm_check, last_alarm_message, alarm_retry_count
-    
+# 컨트롤러 상태 감시 (주기적): 알람 확인과 연결 확인을 한 스레드에서 처리
+def monitor_controller():
+    """가공 중이 아닐 때 alarm_check_interval(초)마다 GRBL 상태를 조회해 알람·연결 상태를 갱신합니다."""
+    global last_alarm_check
+
     while True:
         # 현재 시간 기록
         current_time = time.time()
-        
+
         # 시리얼 연결 상태와 현재 가공 상태 확인 (가공 중에는 스트리밍 스레드만 시리얼을 읽음)
         has_connection = ser and hasattr(ser, 'is_open') and ser.is_open
-        
-        # 일정 간격으로만 알람 확인 (너무 자주 확인하면 통신 부하 발생)
+
+        # 일정 간격으로만 확인 (너무 자주 확인하면 통신 부하 발생)
         if has_connection and not job_active and (current_time - last_alarm_check) >= alarm_check_interval:
             last_alarm_check = current_time
-            
             try:
-                with ser_lock:
-                    if job_active or not ser or not ser.is_open:
-                        raise RuntimeError("skip")
-                    # 이전에 입력 버퍼에 남아있는 데이터가 있으면 읽어서 처리
-                    if ser.in_waiting > 0:
-                        # 버퍼 데이터 모두 읽기
-                        while ser.in_waiting > 0:
-                            buffer_data = ser.readline().decode('utf-8', errors='ignore').strip()
-                            if buffer_data and ("ERROR" in buffer_data.upper() or "ALARM" in buffer_data.upper()):
-                                # 버퍼에서 알람 상태 발견 (긴급정지 상태는 사용자가 해제할 때까지 유지)
-                                if last_alarm_message != buffer_data:
-                                    last_alarm_message = buffer_data
-                                    if state != "emergency":
-                                        state = "alarm"
-                
-                    # 버퍼 내용 처리 후 입력 버퍼 비우기 (중요: 상태 쿼리 전에 버퍼 정리)
-                    ser.reset_input_buffer()
-                
-                    # 상태 확인 명령 전송 (실시간 명령이므로 개행 없이 전송)
-                    ser.write(b"?")
-                
-                    # 응답 대기
-                    start_time = time.time()
-                    max_wait = 0.8  # 응답 대기 시간 (800ms로 충분)
-                
-                    # 응답 대기 (제한된 시간 내에)
-                    response_received = False
-                    while time.time() - start_time < max_wait:
-                        if ser.in_waiting > 0:
-                            # 한 줄씩 읽어서 처리
-                            response = ser.readline().decode('utf-8', errors='ignore').strip()
-                            if response:  # 빈 응답 무시
-                                response_received = True
-                            
-                                # 알람 상태인 경우 (긴급정지 상태는 사용자가 해제할 때까지 유지)
-                                if "ALARM" in response.upper() or "ERROR" in response.upper():
-                                    if state not in ("alarm", "emergency"):
-                                        state = "alarm"
-                                    
-                                        # 알람 상태 표시
-                                        socketio.emit('alarm_update', {'text': f"알람 상태: {response[:50]}", 'color': 'red'})
-                                # 정상 상태인 경우 (Idle)
-                                elif "<" in response and ">" in response and ("Idle" in response or "idle" in response.lower()):
-                                    # 알람이 없고 idle 상태이면 가공 가능 상태로 설정
-                                    if state == "alarm":
-                                        # 알람 상태는 유지 (해제 버튼을 눌러야만 해제됨)
-                                        pass
-                                    elif state not in ["running", "paused", "emergency"]:
-                                        # 알람이 없는 상태일 때는 가공 가능 상태로 설정
-                                        state = "alarm_unlocked"
-                            
-                                break
-                        time.sleep(0.01)
-                
-                if response_received:
-                    alarm_retry_count = 0
-                # 응답이 없는 경우
-                else:
-                    alarm_retry_count += 1
-                    
-                    # 연속적으로 응답이 없을 때만 경고 표시 (로그만 표시하고 UI는 업데이트하지 않음)
-                    if alarm_retry_count >= max_alarm_retries:
-                        # 사용자 혼란 방지를 위해 로그는 한 번만 표시
-                        if state != "connection_warning":
-                            state = "connection_warning"
-                
-            except RuntimeError:
-                pass
+                _poll_controller_status()
             except Exception as e:
-                # 심각한 오류인 경우에만 알람 표시 (일시적인 오류는 무시)
-                alarm_retry_count += 1
-                if alarm_retry_count >= max_alarm_retries:
-                    error_msg = str(e)
-                    if "Device not configured" in error_msg or "Port is closed" in error_msg:
-                        state = "idle"
-                    else:
-                        socketio.emit('log_update', {"message": f"통신 오류: {error_msg[:50]}", "color": "orange"})
-                    alarm_retry_count = 0
+                _handle_controller_error(e)
 
         # 상태가 바뀌었으면 클라이언트에 알림
         notify_state()
-        
+
         # 다음 체크까지 대기 (대기 시간 최적화)
         time.sleep(1.0)
+
+def _poll_controller_status(timeout=0.8):
+    """GRBL 상태를 한 번 조회하고 알람·연결 상태를 갱신합니다.
+
+    - 상태 보고가 Alarm(또는 ALARM: 메시지)이면 알람 상태로 전환 (긴급정지 상태는 사용자가 해제할 때까지 유지)
+    - Idle이면 가공 가능 상태(alarm_unlocked)로 전환 (알람은 해제 버튼으로만 해제)
+    - 연속으로 응답이 없으면 connection_warning, 응답이 돌아오면 경고 해제
+    """
+    global state, last_alarm_message, alarm_retry_count
+    with ser_lock:
+        if job_active or not ser or not ser.is_open:
+            return
+        # 이전 명령의 늦은 응답(ALARM: 메시지 등)을 먼저 읽은 뒤 '?'로 현재 상태 조회 (실시간 명령이므로 개행 없음)
+        earlier = []
+        while ser.in_waiting > 0:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if line:
+                earlier.append(line)
+        ser.write(b"?")
+        replies = []
+        status = None
+        deadline = time.time() + timeout
+        while status is None and time.time() < deadline:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    replies.append(line)
+                    status = parse_status_report(line)
+            else:
+                time.sleep(0.01)
+        port = ser.port
+    if status:
+        _remember_status(status)
+
+    if not replies:
+        # 연속으로 응답이 없을 때만 연결 경고 (일시적인 지연은 무시)
+        alarm_retry_count += 1
+        if alarm_retry_count >= max_alarm_retries and state != "connection_warning":
+            state = "connection_warning"
+        return
+
+    alarm_retry_count = 0
+    if state == "connection_warning":
+        state = "idle"
+        socketio.emit('connection_status', {'connected': True, 'warning': False, 'port': port})
+        socketio.emit('log_update', {"message": "컨트롤러 응답이 정상으로 돌아왔습니다", "color": "green"})
+
+    # 상태 보고를 우선하고, 보고가 없으면 ALARM: 메시지로 판단 ('error:'는 명령 오류일 뿐 알람 상태가 아님)
+    alarm_message = next((line for line in earlier + replies if line.upper().startswith("ALARM")), None)
+    in_alarm = status['state'] == "Alarm" if status else alarm_message is not None
+    if in_alarm:
+        last_alarm_message = alarm_message or replies[-1]
+        if state not in ("alarm", "emergency"):
+            state = "alarm"
+            socketio.emit('alarm_update', {'text': f"알람 상태: {last_alarm_message[:50]}", 'color': 'red'})
+    elif status and status['state'] == "Idle" and state not in ("alarm", "running", "paused", "emergency"):
+        state = "alarm_unlocked"
+
+def _handle_controller_error(error):
+    """상태 조회 중 통신 오류 처리: 시리얼 오류가 반복되면 연결이 끊어진 것으로 보고 포트를 닫습니다.
+
+    (USB 분리 등의 오류 메시지는 OS 언어에 따라 달라지므로 문구가 아니라 오류 종류로 판단)
+    """
+    global ser, state, alarm_retry_count
+    alarm_retry_count += 1
+    if alarm_retry_count < max_alarm_retries:
+        return
+    alarm_retry_count = 0
+    if isinstance(error, (serial.SerialException, OSError)):
+        socketio.emit('log_update', {"message": f"컨트롤러 연결이 끊어졌습니다. 다시 연결해주세요. ({str(error)[:60]})", "color": "red"})
+        with ser_lock:
+            try:
+                if ser:
+                    ser.close()
+            except Exception:
+                pass
+            ser = None
+        state = "idle"
+        socketio.emit('connection_status', {'connected': False, 'port': None})
+        socketio.emit('alarm_update', {'text': "알람 상태 확인중", 'color': 'red'})
+    else:
+        socketio.emit('log_update', {"message": f"통신 오류: {str(error)[:50]}", "color": "orange"})
 
 # 알람 해제 함수
 def unlock_alarm():
@@ -1009,8 +1106,47 @@ def emergency_halt():
             ser.flush()
     notify_state()
 
-def recover_after_reset(timeout=5.0):
-    """긴급정지(소프트 리셋) 후 스트리밍 스레드 종료를 기다린 뒤 GRBL 알람을 해제합니다. 성공 여부 반환."""
+def safe_stop(reason="", timeout=SAFE_STOP_TIMEOUT):
+    """위치를 유지한 채 가공을 멈춥니다: 피드 홀드(!) → Hold:0 확인 → 스핀들 정지(0x9E) → 소프트 리셋(Ctrl-X).
+
+    이동 중 리셋(emergency_halt)은 GRBL이 위치를 보장하지 못해 ALARM:3이 나지만, 감속 정지가 끝난 뒤(Hold:0)
+    리셋하면 알람 없이 위치가 유지됩니다. 순서는 응답을 읽는 스트리밍 스레드가 진행하고(새 줄 전송은 즉시 멈춤),
+    timeout 안에 Hold:0이 오지 않으면 바로 리셋합니다. 가공 중이 아니면 바로 리셋합니다.
+    """
+    global safe_stop_request, state, pause
+    if not job_active:
+        emergency_halt()
+        return
+    with job_lock:
+        safe_stop_request = {'reason': reason, 'timeout': timeout, 'requested_at': time.time()}
+    state = "stopping"
+    pause = True
+    notify_state()
+
+def _finish_safe_stop(hold_complete):
+    """위치 유지 정지의 마지막 단계 (스트리밍 스레드에서 호출): 스핀들 정지 → 소프트 리셋."""
+    global safe_stop_request, state, pause, job_generation
+    with ser_lock:
+        if ser and ser.is_open:
+            if hold_complete:
+                ser.write(b"\x9e")  # 홀드 중 스핀들 정지 (Toggle Spindle Stop, 홀드 상태에서만 동작)
+                ser.flush()
+                time.sleep(0.1)
+            ser.write(b"\x18")      # 소프트 리셋: GRBL 버퍼에 남은 이동 취소
+            ser.flush()
+    with job_lock:
+        job_generation += 1
+        safe_stop_request = None
+    state = "emergency"
+    pause = True
+    if hold_complete:
+        socketio.emit('log_update', {"message": "감속 정지 완료(Hold:0) → 스핀들 정지 → 리셋: 위치를 유지한 채 멈췄습니다.", "color": "orange"})
+    else:
+        socketio.emit('log_update', {"message": "⚠️ 감속 정지 완료(Hold:0)를 확인하지 못해 바로 리셋했습니다. 위치가 틀어졌을 수 있으니 원점을 확인하세요.", "color": "red"})
+    notify_state()
+
+def recover_after_reset(timeout=SAFE_STOP_TIMEOUT + 5.0):
+    """정지(소프트 리셋) 후 스트리밍 스레드 종료를 기다린 뒤 GRBL 알람을 해제합니다. 성공 여부 반환."""
     deadline = time.time() + timeout
     while job_active and time.time() < deadline:
         time.sleep(0.05)
@@ -1079,6 +1215,62 @@ def start_rework_job(path=None):
         socketio.emit('disable_nc_upload', {})
     else:
         socketio.emit('log_update', {"message": message, "color": "red"})
+    return ok, message
+
+# === 데이터 수집 기록 (data/raw/, 설계: edit_analysis.md 3.3) ===
+def recording_status():
+    status = run_recorder.status()
+    status['program'] = program_name
+    status['program_meta'] = dict(program_meta)
+    status['tool'] = {'diameter': tool_diameter, 'flutes': tool_flutes}
+    status['sensor'] = sensor_stream.describe() if sensor_stream else None
+    status['sensor_connected'] = bool(arduino_serial and arduino_serial.is_open)
+    return status
+
+def start_recording(meta):
+    """데이터 수집 기록을 시작합니다. 빈 칸은 NC 파일의 META 주석과 공구 정보로 채웁니다. 반환: (성공 여부, 메시지)"""
+    global tool_diameter, tool_flutes
+    meta = {key: value for key, value in (meta or {}).items() if value not in (None, '')}
+    defaults = {
+        'run_id': program_meta.get('run_id'), 'program': program_name, 'run_type': program_meta.get('type'),
+        'S_rpm': program_meta.get('S'), 'F_mm_min': program_meta.get('F'),
+        'ap_mm': program_meta.get('ap'), 'ae_mm': program_meta.get('ae'),
+        'tool_id': program_meta.get('tool'), 'material': program_meta.get('material'),
+        'tool_diameter_mm': program_meta.get('tool_d') or tool_diameter,
+        'flutes': program_meta.get('flutes') or tool_flutes,
+    }
+    for key, value in defaults.items():
+        if key not in meta and value not in (None, ''):
+            meta[key] = value
+    # 입력한 공구 정보는 감지기의 회전 주파수 고조파 계산과 회전수 제안에도 사용
+    try:
+        if meta.get('flutes'):
+            tool_flutes = int(float(meta['flutes']))
+        if meta.get('tool_diameter_mm'):
+            tool_diameter = float(meta['tool_diameter_mm'])
+    except ValueError:
+        return False, "공구 지름과 날 수는 숫자로 입력하세요."
+    ok, message, _ = run_recorder.start(meta, sensor_stream.describe() if sensor_stream else {})
+    if ok and not (arduino_serial and arduino_serial.is_open):
+        message += " (센서가 연결되어 있지 않아 가공 로그만 기록됩니다)"
+    socketio.emit('log_update', {"message": f"[데이터 수집] {message}", "color": "green" if ok else "red"})
+    socketio.emit('recording_status', recording_status())
+    return ok, message
+
+def mark_recording(label, edge, note=''):
+    """채터 등 라벨 구간의 시작/끝을 현재 시각·X 좌표로 표시합니다. 반환: (성공 여부, 메시지)"""
+    snap = machine_snapshot()
+    ok, message = run_recorder.mark(label, edge, note, (snap['x'], snap['y'], snap['z']))
+    socketio.emit('log_update', {"message": f"[데이터 수집] {message}", "color": "blue" if ok else "red"})
+    socketio.emit('recording_status', recording_status())
+    return ok, message
+
+def stop_recording():
+    """기록을 마치고 data/raw/manifest.csv에 한 줄을 추가합니다. 반환: (성공 여부, 메시지)"""
+    snap = machine_snapshot()
+    ok, message, _ = run_recorder.stop(sensor_stream.describe() if sensor_stream else None, (snap['x'], snap['y'], snap['z']))
+    socketio.emit('log_update', {"message": f"[데이터 수집] {message}", "color": "green" if ok else "red"})
+    socketio.emit('recording_status', recording_status())
     return ok, message
 
 def apply_override(target, value):
@@ -1156,6 +1348,7 @@ def _apply_job_status(status):
     if ov and (ov[0] != feed_override or ov[2] != spindle_override):
         feed_override, spindle_override = ov[0], ov[2]
         socketio.emit('override_status', {'spindle': spindle_override, 'feed': feed_override})
+    _remember_status(status)
     update_ui()
 
 # G코드 명령 전송 및 실행
@@ -1171,7 +1364,7 @@ def send_gcode(generation=None):
     - 모든 줄의 'ok'를 받은 뒤 GRBL이 Idle이 될 때(실제 이동이 끝날 때)까지 기다렸다가 완료 처리합니다.
     """
     global state, pause, progress, current_spindle, current_feedrate, base_spindle, base_feedrate
-    global gcode_current_idx, job_active, process_start_time, last_job_elapsed, last_alarm_message
+    global gcode_current_idx, job_active, process_start_time, last_job_elapsed, last_alarm_message, safe_stop_request
 
     if generation is None:
         generation = job_generation
@@ -1251,10 +1444,21 @@ def send_gcode(generation=None):
         last_ack_time = time.time()
         idle_streak = 0       # 마지막 'ok' 이후 연속으로 받은 Idle 상태 보고 수
         stall_warned = False
+        stop_phase = None     # 위치 유지 정지(safe_stop) 진행 단계: None → 'hold'
+        hold_deadline = 0.0
 
         while True:
             if aborted():
                 break
+
+            # 0) 위치 유지 정지 요청: 새 줄 전송은 이미 멈췄고(state='stopping'), 피드 홀드로 감속 정지
+            if safe_stop_request is not None and stop_phase is None:
+                with ser_lock:
+                    ser.write(b"!")
+                    ser.flush()
+                stop_phase = 'hold'
+                hold_deadline = time.time() + safe_stop_request['timeout']
+                socketio.emit('log_update', {"message": "피드 홀드: 감속 정지 중...", "color": "orange"})
 
             # 1) 가공 중이면 GRBL 수신 버퍼 여유만큼 다음 줄 전송
             if state == "running":
@@ -1335,6 +1539,9 @@ def send_gcode(generation=None):
                         state = "alarm"
                         socketio.emit('alarm_update', {'text': "알람 상태: 해제가 필요합니다", 'color': 'red'})
                     _apply_job_status(status)
+                    if stop_phase == 'hold' and status['state'] == "Hold" and status.get('substate') == 0:
+                        _finish_safe_stop(hold_complete=True)
+                        break
 
                 elif response.startswith("ALARM"):
                     state = "alarm"
@@ -1344,6 +1551,9 @@ def send_gcode(generation=None):
 
                 else:
                     socketio.emit('log_update', {"message": f"GRBL: {response}", "color": "gray"})
+
+            if stop_phase == 'hold' and state == "stopping" and time.time() > hold_deadline:
+                _finish_safe_stop(hold_complete=False)
 
             # 4) 완료: 모든 줄의 'ok' 수신 후 GRBL이 연속으로 Idle을 보고하면 실제 이동이 끝난 것
             if idx >= total and not pending and idle_streak >= 2:
@@ -1358,7 +1568,7 @@ def send_gcode(generation=None):
     except Exception as e:
         logger.error(f"G코드 전송 중 오류: {e}", exc_info=True)
         socketio.emit('log_update', {"message": f"G코드 전송 중 오류: {str(e)}", "color": "red"})
-        if generation == job_generation and state in ("running", "paused"):
+        if generation == job_generation and state in ("running", "paused", "stopping"):
             # GRBL 버퍼에 이미 보낸 이동이 남아 있으므로 소프트 리셋으로 정지 (긴급정지 해제 후 다시 시작)
             try:
                 with ser_lock:
@@ -1378,6 +1588,7 @@ def send_gcode(generation=None):
         gcode_current_idx = 0 if completed else idx
         with job_lock:
             job_active = False
+            safe_stop_request = None
 
         if completed:
             state = "idle"
@@ -1386,7 +1597,7 @@ def send_gcode(generation=None):
             socketio.emit('log_update', {"message": "가공이 성공적으로 완료되었습니다.", "color": "green"})
             socketio.emit('enable_nc_upload', {})
         else:
-            if state in ("running", "paused"):
+            if state in ("running", "paused", "stopping"):
                 # 스레드가 끝났으므로 재개할 수 없음 (포트 끊김 등으로 중단된 경우 다시 시작)
                 state = "idle"
             socketio.emit('log_update', {"message": "가공이 중단되었습니다.", "color": "red"})
@@ -1420,113 +1631,6 @@ def update_ui(full=False):
     ui_sent_len = end
 
 
-# 주기적 연결 상태 확인
-def check_connection():
-    """주기적으로 컨트롤러 연결 상태를 확인합니다."""
-    global ser, state
-    
-    # 연결 확인 관련 변수
-    check_interval = 5.0  # 5초마다 연결 상태 확인
-    consecutive_failures = 0
-    max_consecutive_failures = 3
-    last_check_time = 0
-    
-    while True:
-        try:
-            # 현재 시간 확인
-            current_time = time.time()
-            
-            # 일정 간격으로만 확인 (너무 자주 확인하면 성능 저하)
-            if current_time - last_check_time < check_interval:
-                time.sleep(0.5)
-                continue
-                
-            # 확인 시간 업데이트
-            last_check_time = current_time
-            
-            # 시리얼 연결이 있고, 열려있고, 가공 작업(일시정지 포함)이 없을 때만 체크
-            if ser and hasattr(ser, 'is_open') and ser.is_open and not job_active:
-                try:
-                    with ser_lock:
-                        if job_active or not ser or not ser.is_open:
-                            continue
-                        # 버퍼에 남아 있는 데이터가 있으면 처리 (로그 남기지 않음)
-                        if ser.in_waiting > 10:
-                            ser.reset_input_buffer()
-                    
-                        # 간단한 상태 확인 명령 (실시간 명령이므로 개행 없이 전송)
-                        ser.write(b"?")
-                        ser.flush()
-                    
-                        # 응답 대기
-                        start_time = time.time()
-                        response_timeout = 0.8  # 응답 타임아웃 시간
-                        response_received = False
-                    
-                        while time.time() - start_time < response_timeout:
-                            if ser.in_waiting > 0:
-                                try:
-                                    response = ser.readline().decode('utf-8', errors='ignore').strip()
-                                    if response:
-                                        response_received = True
-                                    
-                                        # 알람 상태 확인 (긴급정지 상태는 사용자가 해제할 때까지 유지)
-                                        if "ERROR" in response.upper() or "ALARM" in response.upper():
-                                            if state not in ("alarm", "emergency"):
-                                                state = "alarm"
-                                    
-                                        # 연결 경고 상태 해제
-                                        if state == "connection_warning":
-                                            state = "idle"
-                                            socketio.emit('connection_status', {'connected': True, 'warning': False, 'port': ser.port})
-                                            socketio.emit('log_update', {"message": "컨트롤러 응답이 정상으로 돌아왔습니다", "color": "green"})
-                                    
-                                        # 응답 성공으로 실패 카운터 초기화
-                                        consecutive_failures = 0
-                                        break
-                                except Exception:
-                                    # 응답 처리 중 오류는 무시하고 계속 진행
-                                    pass
-                                
-                            time.sleep(0.05)
-                    
-                    # 응답을 받지 못한 경우
-                    if not response_received:
-                        consecutive_failures += 1
-                        
-                        # 연속 실패 횟수에 따른 처리 (로그 과다 방지)
-                        if consecutive_failures >= max_consecutive_failures and state != "connection_warning":
-                            state = "connection_warning"
-                
-                except Exception as e:
-                    # 심각한 통신 문제 발생 시
-                    consecutive_failures += 1
-                    
-                    if consecutive_failures >= max_consecutive_failures:
-                        error_msg = str(e)
-                        
-                        # 연결이 실제로 끊어진 경우
-                        if "not open" in error_msg.lower() or "timeout" in error_msg.lower():
-                            socketio.emit('log_update', {"message": "컨트롤러 연결이 끊어졌습니다. 다시 연결해주세요.", "color": "red"})
-                            
-                            # 연결 상태 업데이트
-                            with ser_lock:
-                                ser = None
-                            state = "idle"
-                            socketio.emit('connection_status', {'connected': False, 'port': None})
-                            socketio.emit('alarm_update', {'text': "알람 상태 확인중", 'color': 'red'})
-                            
-                            # 연속 실패 카운터 초기화
-                            consecutive_failures = 0
-            else:
-                # 연결이 없거나 가공 중일 때는 카운터 초기화
-                consecutive_failures = 0
-        
-        except Exception as e:
-            # 스레드 내부 예외 처리 - 로그만 남기고 계속 실행
-            print(f"연결 확인 스레드 내부 오류: {str(e)}")
-            time.sleep(check_interval)  # 오류 후 대기
-
 # rework.nc 감시 시작 (서버 프로세스 내부에서 콜백으로 처리, 별도 watcher.py 실행 불필요)
 def start_nc_file_watcher():
     observer = start_rework_watcher(os.path.join(BASE_DIR, 'nc'), on_rework_file_ready)
@@ -1547,13 +1651,9 @@ if __name__ == '__main__':
     # 진동 분석 모델 학습 (첫 가공 시작이 지연되지 않도록 서버 시작 시 백그라운드에서 수행)
     threading.Thread(target=get_vibration_monitor, daemon=True).start()
     
-    # 알람 확인 스레드 시작 (백그라운드)
-    alarm_thread = threading.Thread(target=check_alarm, daemon=True)
-    alarm_thread.start()
-    
-    # 연결 상태 확인 스레드 시작 (백그라운드)
-    connection_thread = threading.Thread(target=check_connection, daemon=True)
-    connection_thread.start()
+    # 컨트롤러 상태 감시 스레드 시작 (알람·연결 상태 확인, 백그라운드)
+    monitor_thread = threading.Thread(target=monitor_controller, daemon=True)
+    monitor_thread.start()
     
     # 아두이노 데이터 읽기 스레드 시작 (백그라운드)
     arduino_thread = threading.Thread(target=read_arduino_serial, daemon=True)

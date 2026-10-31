@@ -5,8 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>스마트 가공 시스템</title>
     <link rel="stylesheet" href="/static/style.css">
-    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+    <!-- 인터넷이 없는 PC에서도 동작하도록 라이브러리를 static/vendor에 포함 (출처: cdn.socket.io, cdn.jsdelivr.net) -->
+    <script src="/static/vendor/socket.io-4.7.2.min.js"></script>
+    <script src="/static/vendor/chart-3.9.1.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -122,8 +123,17 @@
                     <!-- 경계선 추가 -->
                     <div class="control-divider"></div>
                     
-                    <!-- 이상 진동 감지 자동화 기능 -->
-                    <!-- (REMOVED) -->
+                    <!-- 이상 진동 감지 모델 상태, 실시간 지표, 모델 관리·데이터 수집 창 열기 -->
+                    <div class="vibration-controls-row">
+                        <div class="vibration-status">
+                            <span id="vibration-status-text">진동 감지 모델: 확인 중...</span>
+                            <span id="vibration-live-text" class="vibration-live"></span>
+                        </div>
+                        <div class="vibration-buttons">
+                            <button id="vibration-settings-btn" class="vibration-btn">진동 감지 모델</button>
+                            <button id="recording-btn" class="vibration-btn">데이터 수집</button>
+                        </div>
+                    </div>
                 </div>
                 
                 <!-- 2열 패널 컨테이너 -->
@@ -224,6 +234,10 @@
                             <!-- 센서 포트 제어 UI -->
                             <div class="sensor-controls">
                                 <select id="sensor-port-select"></select>
+                                <select id="sensor-baud-select" title="센서 통신 속도: 115200은 기존 펌웨어(arduino/MPU6050), 500000은 고속 펌웨어(arduino/MPU6050_fast)">
+                                    <option value="115200">115200</option>
+                                    <option value="500000">500000 (고속)</option>
+                                </select>
                                 <button id="refresh-sensor-port-btn" class="small-btn">새로고침</button>
                                 <button id="connect-sensor-btn" class="small-btn">연결</button>
                                 <button id="disconnect-sensor-btn" class="small-btn" style="display:none;">연결 해제</button>
@@ -270,15 +284,33 @@
     
     <!-- 이상 진동 감지 설정 모달 -->
     <div id="vibration-settings-modal" class="modal">
-        <div class="modal-content">
+        <div class="modal-content vibration-modal-content">
             <div class="modal-header">
                 <h4>이상 진동 감지 모델 관리</h4>
                 <span class="close-modal">&times;</span>
             </div>
             <div class="modal-body">
+                <div id="vibration-model-status" class="model-status">모델 상태를 불러오는 중...</div>
+                <div id="vibration-model-files" class="model-file-list"></div>
+                <div class="model-section">
+                    <h5>감지 설정</h5>
+                    <div class="setting-row">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="mitigation-enabled">
+                            이상 감지 시 먼저 오버라이드로 회전수·이송을 바꾸고, 진정되지 않으면 정지 (온라인 대응)
+                        </label>
+                    </div>
+                    <div class="setting-row">
+                        <label for="decision-mode">판정 방식</label>
+                        <select id="decision-mode">
+                            <option value="k_of_n">연속 초과 (1초 동안 계속 기준 초과)</option>
+                            <option value="cusum">누적합 CUSUM (큰 이상은 더 빨리)</option>
+                        </select>
+                    </div>
+                </div>
                 <div class="model-section">
                     <h5>모델 학습</h5>
-                    <p>학습 데이터를 사용하여 이상 진동 감지 모델을 학습합니다.</p>
+                    <p>정상 가공 데이터(데이터 수집으로 기록한 data/raw/*_sensor.csv 또는 예전 '센서 데이터 저장' CSV, AccX·AccY·AccZ 열)를 학습 데이터 폴더에 추가하고, 폴더 전체로 모델을 다시 학습합니다. 파일 이름에 '이상'이 들어간 파일은 학습에서 제외됩니다.</p>
                     <div class="input-group">
                         <label for="train-model-file">학습 데이터 파일 선택:</label>
                         <input type="file" id="train-model-file" accept=".csv">
@@ -287,31 +319,55 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button id="reset-vibration-analyzer" class="control-btn modal-btn">감지기 초기화</button>
+                <button id="reset-vibration-analyzer" class="control-btn modal-btn" title="학습 데이터 폴더의 파일로 모델을 다시 학습하고 감지 버퍼를 비웁니다">감지기 초기화</button>
                 <button id="cancel-vibration-settings" class="control-btn modal-btn">닫기</button>
             </div>
         </div>
     </div>
-    
-    <!-- 이상 진동 감지 알림 모달 -->
-    <div id="vibration-alert-modal" class="modal">
-        <div class="modal-content alert-modal">
-            <div class="modal-header alert-header">
-                <h4>⚠️ 이상 진동 감지!</h4>
+
+    <!-- 데이터 수집 창 (data/raw/에 센서·가공 로그·라벨 기록, 설계: edit_analysis.md 3.3) -->
+    <div id="recording-modal" class="modal">
+        <div class="modal-content vibration-modal-content">
+            <div class="modal-header">
+                <h4>데이터 수집</h4>
                 <span class="close-modal">&times;</span>
             </div>
             <div class="modal-body">
-                <p>가공 중 이상 진동이 감지되었습니다.</p>
-                <p id="alert-position">위치: X: 0.0, Y: 0.0, Z: 0.0</p>
-                <div id="recovery-message"></div>
+                <div id="recording-status" class="model-status">기록 상태를 불러오는 중...</div>
+                <p class="modal-help">실험용 NC(scripts/make_experiment_nc.py로 생성)를 불러오면 META 주석의 조건이 빈 칸에 채워집니다. 기록 시작 → 가공 → (채터가 들리거나 보이면) 구간 시작/끝 표시 → 기록 종료 순서로 진행하세요. 파일은 data/raw/에 저장되고 manifest.csv에 한 줄이 추가됩니다.</p>
+                <div class="recording-form">
+                    <label>실행 ID<input id="rec-run_id" type="text" placeholder="비우면 시각으로 생성"></label>
+                    <label>회전수 S (rpm)<input id="rec-S_rpm" type="number" step="100"></label>
+                    <label>이송 F (mm/min)<input id="rec-F_mm_min" type="number" step="1"></label>
+                    <label>절입 깊이 ap (mm)<input id="rec-ap_mm" type="number" step="0.01"></label>
+                    <label>절삭 폭 ae (mm)<input id="rec-ae_mm" type="number" step="0.01"></label>
+                    <label>공구 ID<input id="rec-tool_id" type="text"></label>
+                    <label>공구 지름 (mm)<input id="rec-tool_diameter_mm" type="number" step="0.1"></label>
+                    <label>날 수<input id="rec-flutes" type="number" step="1" min="1"></label>
+                    <label>돌출 길이 (mm)<input id="rec-stickout_mm" type="number" step="0.1"></label>
+                    <label>소재<input id="rec-material" type="text"></label>
+                    <label>가공면 사진 파일<input id="rec-photo" type="text"></label>
+                    <label>메모<input id="rec-notes" type="text"></label>
+                </div>
+                <div class="recording-label-row">
+                    <label for="rec-label-select">라벨 구간</label>
+                    <select id="rec-label-select">
+                        <option value="chatter">채터</option>
+                        <option value="transition">전이 (채터가 시작되는 중)</option>
+                        <option value="air">비가공 (공회전·이동)</option>
+                    </select>
+                    <button id="rec-mark-start-btn" class="control-btn modal-btn">구간 시작</button>
+                    <button id="rec-mark-end-btn" class="control-btn modal-btn">구간 끝</button>
+                </div>
             </div>
             <div class="modal-footer">
-                <button id="execute-recovery-btn" class="control-btn modal-btn">복구 가공 실행</button>
-                <button id="close-alert-btn" class="control-btn modal-btn">닫기</button>
+                <button id="rec-start-btn" class="control-btn modal-btn">기록 시작</button>
+                <button id="rec-stop-btn" class="control-btn modal-btn">기록 종료</button>
+                <button id="rec-close-btn" class="control-btn modal-btn">닫기</button>
             </div>
         </div>
     </div>
-    
+
     <!-- 이상 진동 감지 알림 -->
     <div id="vibration-alert" class="vibration-alert">
         <h3>⚠️ 이상 진동 감지</h3>

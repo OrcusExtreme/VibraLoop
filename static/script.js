@@ -133,7 +133,11 @@ function initPage() {
     
     // 센서 포트 목록 가져오기
     fetchSensorPorts();
-    
+
+    // 진동 감지 모델 학습 상태와 데이터 수집 기록 상태 표시
+    refreshVibrationModelStatus();
+    refreshRecordingStatus(false);
+
     // 센서 로그 초기화
     addSensorLog('센서 데이터 로깅 시작됨', 'info');
 }
@@ -879,6 +883,17 @@ function initSocketListeners() {
             if (data.state !== 'running') {
                 stopProcessingTimer();
             }
+            if (data.state !== 'running' && data.state !== 'stopping') {
+                renderVibrationLive(null);
+            }
+        });
+
+        // 실시간 진동 지표와 데이터 수집 상태
+        socket.on('vibration_status', function(data) {
+            renderVibrationLive(data);
+        });
+        socket.on('recording_status', function(data) {
+            renderRecordingStatus(data);
         });
 
         // 허용 공차 수신 (입력창을 서버 값과 일치)
@@ -1018,6 +1033,8 @@ function initSocketListeners() {
             
             if (data.show) {
                 if (alertPopup) {
+                    const detail = alertPopup.querySelector ? alertPopup.querySelector('p') : null;
+                    if (detail && data.message) detail.textContent = data.message;
                     alertPopup.classList.add('show');
                     // 3초 후 자동으로 알림 닫기
                     setTimeout(() => {
@@ -1554,7 +1571,43 @@ function initEventListeners() {
             if (modal) modal.style.display = 'none';
         });
     });
-    
+
+    // 진동 감지 모델 관리 창
+    safeAddEventListener('vibration-settings-btn', 'click', function() {
+        openModal('vibration-settings-modal');
+        refreshVibrationModelStatus();
+    });
+    safeAddEventListener('cancel-vibration-settings', 'click', function() {
+        closeModal('vibration-settings-modal');
+    });
+    safeAddEventListener('train-model-btn', 'click', trainVibrationModel);
+    safeAddEventListener('reset-vibration-analyzer', 'click', resetVibrationAnalyzer);
+    safeAddEventListener('mitigation-enabled', 'change', function() {
+        saveVibrationSettings({ mitigation_enabled: this.checked });
+    });
+    safeAddEventListener('decision-mode', 'change', function() {
+        saveVibrationSettings({ decision_mode: this.value });
+    });
+
+    // 데이터 수집 창
+    safeAddEventListener('recording-btn', 'click', function() {
+        openModal('recording-modal');
+        refreshRecordingStatus(true);
+    });
+    safeAddEventListener('rec-close-btn', 'click', function() {
+        closeModal('recording-modal');
+    });
+    safeAddEventListener('rec-start-btn', 'click', startRecording);
+    safeAddEventListener('rec-stop-btn', 'click', stopRecording);
+    safeAddEventListener('rec-mark-start-btn', 'click', function() { markRecording('start'); });
+    safeAddEventListener('rec-mark-end-btn', 'click', function() { markRecording('end'); });
+
+    // 센서 통신 속도: 마지막으로 연결한 값 복원 (115200 기존 펌웨어, 500000 고속 펌웨어)
+    const baudSelect = document.getElementById('sensor-baud-select');
+    let savedBaud = null;
+    try { savedBaud = localStorage.getItem('lastSensorBaud'); } catch (e) { savedBaud = null; }
+    if (baudSelect && savedBaud) baudSelect.value = savedBaud;
+
 
     
     // 가공 시작 버튼 (일시정지 상태에서는 중단된 지점부터 재개)
@@ -2080,6 +2133,309 @@ function closeModal(modalId) {
     }
 }
 
+// 진동 감지 모델 상태 조회 (서버 시작 직후 모델을 학습하는 동안은 잠시 뒤 다시 조회)
+let vibrationModelRetryTimer = null;
+function refreshVibrationModelStatus() {
+    clearTimeout(vibrationModelRetryTimer);
+    fetch('/api/vibration/model')
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                renderVibrationModelStatus(data.model);
+            } else {
+                renderVibrationModelStatus(null, data.message);
+                vibrationModelRetryTimer = setTimeout(refreshVibrationModelStatus, 2000);
+            }
+        })
+        .catch(error => {
+            console.error('진동 감지 모델 상태 조회 실패:', error);
+            renderVibrationModelStatus(null, '모델 상태를 불러오지 못했습니다.');
+        });
+}
+
+// 제어 영역의 상태 문구와 모델 관리 창 내용을 갱신 (model이 null이면 message만 표시)
+function renderVibrationModelStatus(model, message) {
+    const summary = document.getElementById('vibration-status-text');
+    const detail = document.getElementById('vibration-model-status');
+    const fileList = document.getElementById('vibration-model-files');
+    const untrained = !!model && !model.is_trained;
+    let summaryText = `진동 감지 모델: ${message}`;
+    let detailText = message;
+    let files = [];
+
+    if (model && model.is_trained) {
+        summaryText = `진동 감지 모델: 학습됨 (정상 데이터 ${model.files.length}개 파일)`;
+        const thresholds = model.thresholds || {};
+        const lines = [
+            '상태: 학습됨',
+            `학습 데이터: ${model.training_dir} (파일 ${model.files.length}개, 샘플 ${model.samples.toLocaleString()}개, 가공 윈도우 ${(model.windows || 0).toLocaleString()}개)`
+        ];
+        if (thresholds.rms_g !== null && thresholds.rms_g !== undefined) {
+            lines.push(`기준: 진동 크기 ${thresholds.rms_g.toFixed(3)} g, LOF 점수 ${thresholds.lof.toFixed(2)}` +
+                (thresholds.calibration === 'session_holdout' ? ' (파일 단위로 검증한 값)' : ''));
+        }
+        const optimizerInfo = model.optimizer || {};
+        lines.push('재가공·온라인 대응 조건: ' + (optimizerInfo.model ? '채터 확률 모델' : '채터 확률 모델 없음 → 채터 주파수 또는 기본 규칙') +
+            (model.condition_model ? ', 조건 모델로 진동 크기 비교' : ''));
+        if (model.sensor && model.sensor.fs) {
+            lines.push(`센서: ${model.sensor.device || ''} ${Math.round(model.sensor.fs)} Hz, ±${model.sensor.range_g} g`);
+        }
+        detailText = lines.join('\n');
+        files = model.files;
+    } else if (model) {
+        summaryText = '진동 감지 모델: 학습 안 됨 (이상 진동 감지 꺼짐)';
+        detailText = `상태: 학습 안 됨 - 이상 진동 감지가 동작하지 않습니다.\n` +
+            `${model.training_dir} 폴더에 정상 가공 센서 CSV를 넣거나 아래에서 파일을 올려 학습하세요.`;
+    }
+    if (model && model.is_training) {
+        detailText += '\n지금 모델을 다시 학습하는 중입니다.';
+    }
+
+    if (summary) {
+        summary.textContent = summaryText;
+        summary.title = summaryText;
+        summary.classList.toggle('untrained', untrained);
+    }
+    if (detail) {
+        detail.textContent = detailText;
+        detail.classList.toggle('untrained', untrained);
+    }
+    if (fileList) {
+        fileList.textContent = files.join('\n');
+    }
+    if (model && model.settings) {
+        const mitigation = document.getElementById('mitigation-enabled');
+        if (mitigation && document.activeElement !== mitigation) mitigation.checked = !!model.settings.mitigation_enabled;
+        const mode = document.getElementById('decision-mode');
+        if (mode && document.activeElement !== mode) mode.value = model.settings.decision_mode;
+    }
+}
+
+// 감지 설정 저장 (온라인 대응 켜기/끄기, 판정 방식). 가공 중에도 다음 판정부터 적용됩니다.
+function saveVibrationSettings(updates) {
+    fetch('/api/vibration/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates)
+    })
+        .then(response => response.json())
+        .then(data => {
+            showNotification(data.message, data.status === 'success' ? 'success' : 'error');
+            if (data.model) renderVibrationModelStatus(data.model);
+        })
+        .catch(error => {
+            console.error('감지 설정 저장 실패:', error);
+            showNotification('감지 설정을 저장하지 못했습니다.', 'error');
+            refreshVibrationModelStatus();
+        });
+}
+
+// 실시간 진동 지표 (서버가 판정할 때마다 최대 초당 2번 보냄, data가 없으면 표시를 지움)
+function renderVibrationLive(data) {
+    const el = document.getElementById('vibration-live-text');
+    if (!el) return;
+    let text = '';
+    let level = '';
+    if (data) {
+        if (data.stage === 'mitigating') {
+            text = '· 온라인 대응 중';
+            level = 'warn';
+        } else if (data.stage === 'stopping' || data.stage === 'detected') {
+            text = '· 이상 진동: 정지 중';
+            level = 'alarm';
+        } else if (!data.gate) {
+            text = '· 판정 구간 밖 (소재 밖·급속 이동)';
+        } else if (data.evidence === null || data.evidence === undefined) {
+            text = '· 판정 준비 중';
+        } else {
+            text = `· 지표 ${Number(data.evidence).toFixed(2)}`;
+            level = data.alarm ? 'alarm' : (data.evidence >= 1 ? 'warn' : '');
+        }
+    }
+    el.textContent = text;
+    el.title = data && data.parts ? Object.entries(data.parts).map(([k, v]) => `${k} ${v}`).join(', ') : '';
+    el.classList.toggle('alarm', level === 'alarm');
+    el.classList.toggle('warn', level === 'warn');
+}
+
+// ===== 데이터 수집 기록 (data/raw/) =====
+const RECORDING_FIELDS = ['run_id', 'S_rpm', 'F_mm_min', 'ap_mm', 'ae_mm', 'tool_id', 'tool_diameter_mm',
+    'flutes', 'stickout_mm', 'material', 'photo', 'notes'];
+const RECORDING_LABELS = { chatter: '채터', transition: '전이', air: '비가공', stable: '안정' };
+let recordingPollTimer = null;
+
+function refreshRecordingStatus(fillForm) {
+    fetch('/api/recording/status')
+        .then(response => response.json())
+        .then(data => {
+            if (data.recording) renderRecordingStatus(data.recording, fillForm);
+        })
+        .catch(error => console.error('데이터 수집 상태 조회 실패:', error));
+}
+
+function renderRecordingStatus(rec, fillForm) {
+    if (!rec) return;
+    const statusEl = document.getElementById('recording-status');
+    const button = document.getElementById('recording-btn');
+    let text;
+    if (rec.active) {
+        const openLabels = (rec.open_labels || []).map(label => RECORDING_LABELS[label] || label);
+        text = `● 기록 중: ${rec.run_id} (${Math.round(rec.elapsed)}초, 센서 ${rec.sensor_samples.toLocaleString()}샘플` +
+            (rec.sensor_dropped ? `, 누락 ${rec.sensor_dropped}` : '') +
+            `, 가공 로그 ${rec.machine_rows}줄, 라벨 구간 ${rec.labels}개)` +
+            (openLabels.length ? `\n열린 구간: ${openLabels.join(', ')}` : '');
+    } else {
+        text = '기록하지 않는 중';
+        if (rec.last_run) {
+            text += `\n마지막 기록: ${rec.last_run.run_id} (${rec.last_run.duration_s}초, 센서 ${rec.last_run.sensor_samples}샘플, 라벨 구간 ${rec.last_run.labels}개)`;
+        }
+    }
+    let sensorText = '연결되지 않음';
+    if (rec.sensor_connected) {
+        sensorText = rec.sensor && rec.sensor.fs
+            ? `${rec.sensor.device} ${Math.round(rec.sensor.fs)} Hz, ±${rec.sensor.range_g} g`
+            : '연결됨 (기존 펌웨어: 장치 시각 없음, 고속 펌웨어 권장)';
+    }
+    text += `\n센서: ${sensorText}`;
+    if (statusEl) statusEl.textContent = text;
+    if (button) {
+        button.classList.toggle('active', !!rec.active);
+        button.textContent = rec.active ? '기록 중' : '데이터 수집';
+    }
+    const startBtn = document.getElementById('rec-start-btn');
+    if (startBtn) startBtn.disabled = !!rec.active;
+    ['rec-stop-btn', 'rec-mark-start-btn', 'rec-mark-end-btn'].forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.disabled = !rec.active;
+    });
+    if (fillForm && !rec.active) fillRecordingForm(rec);
+
+    // 기록 중에는 2초마다 진행 상황 갱신
+    clearTimeout(recordingPollTimer);
+    if (rec.active) recordingPollTimer = setTimeout(() => refreshRecordingStatus(false), 2000);
+}
+
+// 빈 칸만 NC 파일의 META 주석(실험 조건)과 공구 정보로 채움
+function fillRecordingForm(rec) {
+    const meta = rec.program_meta || {};
+    const tool = rec.tool || {};
+    const defaults = {
+        run_id: meta.run_id, S_rpm: meta.S, F_mm_min: meta.F, ap_mm: meta.ap, ae_mm: meta.ae,
+        tool_id: meta.tool, material: meta.material,
+        tool_diameter_mm: meta.tool_d || tool.diameter, flutes: meta.flutes || tool.flutes
+    };
+    Object.entries(defaults).forEach(([key, value]) => {
+        const input = document.getElementById(`rec-${key}`);
+        if (input && !input.value && value !== undefined && value !== null && value !== '') input.value = value;
+    });
+}
+
+function recordingFormValues() {
+    const values = {};
+    RECORDING_FIELDS.forEach(key => {
+        const input = document.getElementById(`rec-${key}`);
+        if (input && input.value !== '') values[key] = input.value;
+    });
+    return values;
+}
+
+function postRecording(url, body) {
+    return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+    })
+        .then(response => response.json())
+        .then(data => {
+            showNotification(data.message, data.status === 'success' ? 'success' : 'error');
+            if (data.recording) renderRecordingStatus(data.recording);
+            return data;
+        })
+        .catch(error => {
+            console.error('데이터 수집 요청 실패:', error);
+            showNotification('데이터 수집 요청 중 오류가 발생했습니다.', 'error');
+            return null;
+        });
+}
+
+function startRecording() {
+    postRecording('/api/recording/start', recordingFormValues());
+}
+
+function stopRecording() {
+    postRecording('/api/recording/stop').then(data => {
+        // 다음 실행은 새로 불러온 NC의 실행 ID를 쓰도록 실행별 값은 비움
+        if (data && data.status === 'success') {
+            ['run_id', 'photo', 'notes'].forEach(key => {
+                const input = document.getElementById(`rec-${key}`);
+                if (input) input.value = '';
+            });
+        }
+    });
+}
+
+function markRecording(edge) {
+    const select = document.getElementById('rec-label-select');
+    postRecording('/api/recording/mark', { label: select ? select.value : 'chatter', edge: edge });
+}
+
+// 진동 감지 모델 학습/초기화 요청 (응답이 올 때까지 버튼을 막고 진행 중임을 표시)
+function requestVibrationModelChange(url, body, busyMessage, onSuccess) {
+    const buttons = ['train-model-btn', 'reset-vibration-analyzer']
+        .map(id => document.getElementById(id))
+        .filter(Boolean);
+    buttons.forEach(btn => { btn.disabled = true; });
+    const detail = document.getElementById('vibration-model-status');
+    if (detail) detail.textContent = busyMessage;
+
+    fetch(url, { method: 'POST', body: body })
+        .then(response => response.json())
+        .then(data => {
+            // 시스템 로그는 서버의 log_update 이벤트로 남으므로 여기서는 알림만 표시
+            showNotification(data.message, data.status === 'success' ? 'success' : 'error');
+            if (data.status === 'success' && onSuccess) onSuccess();
+            if (data.model) {
+                renderVibrationModelStatus(data.model);
+            } else {
+                refreshVibrationModelStatus();
+            }
+        })
+        .catch(error => {
+            console.error('진동 감지 모델 요청 실패:', error);
+            showNotification('진동 감지 모델 요청 중 오류가 발생했습니다.', 'error');
+            refreshVibrationModelStatus();
+        })
+        .finally(() => {
+            buttons.forEach(btn => { btn.disabled = false; });
+        });
+}
+
+// 선택한 정상 가공 CSV를 학습 데이터에 추가하고 모델 재학습
+function trainVibrationModel() {
+    const input = document.getElementById('train-model-file');
+    const file = input && input.files[0];
+    if (!file) {
+        showNotification('학습할 CSV 파일을 선택하세요.', 'warning');
+        return;
+    }
+    if (!confirm(`'${file.name}' 파일을 학습 데이터에 추가하고 모델을 다시 학습할까요?`)) {
+        return;
+    }
+    const formData = new FormData();
+    formData.append('train_file', file);
+    requestVibrationModelChange('/api/vibration/train', formData,
+        '모델을 학습하는 중입니다... 잠시 기다려 주세요.',
+        () => { input.value = ''; });
+}
+
+// 학습 데이터 폴더의 파일로 모델을 다시 학습하고 감지 상태 초기화
+function resetVibrationAnalyzer() {
+    if (!confirm('학습 데이터 폴더의 파일로 모델을 다시 학습하고 감지 버퍼를 비울까요?')) {
+        return;
+    }
+    requestVibrationModelChange('/api/vibration/reset', null, '학습 데이터 폴더로 모델을 다시 학습하는 중입니다...');
+}
+
 // 소켓 이벤트 핸들러 등록
 function registerSocketEvents() {
     // 이 함수는 사용하지 않음 - 모든 소켓 이벤트 핸들러는 initSocketListeners에서 처리
@@ -2242,8 +2598,9 @@ function handleArduinoSensorData(jsonData) {
             gyroZ: data.gyro?.z ?? null
         };
         sensorDataArray.push(sensorData);
-        // 선택적으로 센서 로그 UI에도 표시
-        const logMessage = `[센서] ACC(X:${sensorData.accX?.toFixed(3)}, Y:${sensorData.accY?.toFixed(3)}, Z:${sensorData.accZ?.toFixed(3)}) GYRO(X:${sensorData.gyroX?.toFixed(3)}, Y:${sensorData.gyroY?.toFixed(3)}, Z:${sensorData.gyroZ?.toFixed(3)})`;
+        // 선택적으로 센서 로그 UI에도 표시 (자이로가 없는 고속 펌웨어는 '-')
+        const fmt = value => (value === null || value === undefined) ? '-' : Number(value).toFixed(3);
+        const logMessage = `[센서] ACC(X:${fmt(sensorData.accX)}, Y:${fmt(sensorData.accY)}, Z:${fmt(sensorData.accZ)}) GYRO(X:${fmt(sensorData.gyroX)}, Y:${fmt(sensorData.gyroY)}, Z:${fmt(sensorData.gyroZ)})`;
         addSensorLog(logMessage, 'sensor');
     } catch (e) {
         // JSON 파싱 실패 시 텍스트 형식 파싱 시도 (예: "x: 5319 y: 5824 z: 2801")
@@ -2375,13 +2732,18 @@ function connectSensorPort() {
     // 포트 상태 표시
     addLog(`센서 ${port} 연결 시도 중...`, 'info');
     
+    // 통신 속도: 115200(기존 펌웨어) 또는 500000(고속 펌웨어 MPU6050_fast)
+    const baudSelect = document.getElementById('sensor-baud-select');
+    const baud = baudSelect && baudSelect.value ? Number(baudSelect.value) : 115200;
+
     // 연결 요청 - routes.py의 handle_connect_sensor 핸들러 호출
-    socket.emit('connect_sensor', {port: port}, function(response) {
+    socket.emit('connect_sensor', {port: port, baud: baud}, function(response) {
         if (response && response.status === 'success') {
             showNotification(response.message, 'success');
-            
+
             // 상태 저장
             localStorage.setItem('lastConnectedSensorPort', port);
+            localStorage.setItem('lastSensorBaud', String(baud));
         } else {
             const errorMsg = response ? response.message : '서버로부터 응답이 없습니다';
             showNotification(errorMsg, 'error');

@@ -1,3 +1,2 @@
-Abnormal vibration detected at 2025-11-28 18:05:07
-Current position: X=0.000, Y=70.000, Z=0.840
-Spindle speed: 100%
+DetectedAt,X,Y,Z,SpindleRPM,FeedRate,SpindleOverride,FeedOverride,Evidence,ChatterHz,Action
+2025-11-28 18:05:07,0.000,70.000,0.840,,,100,,,,

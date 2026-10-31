@@ -17,8 +17,13 @@ F_WORD_RE = re.compile(r'F\s*' + NUMBER, re.IGNORECASE)
 Z_WORD_RE = re.compile(r'Z\s*(' + NUMBER + ')', re.IGNORECASE)
 
 
-def _rework_line(line, n_val, f_val, z_offset, modal):
-    """한 줄에 최적 S/F를 적용하고, 절대좌표(G90) 이동이면 Z를 z_offset만큼 이동합니다."""
+def _scaled_z(z, z_scale):
+    """절삭 깊이(소재 윗면 Z0 아래, 음수 Z)만 비율로 줄이고 안전 높이 등 양수 Z는 그대로 둡니다."""
+    return z * z_scale if z < 0 else z
+
+
+def _rework_line(line, n_val, f_val, z_offset, modal, z_scale=1.0):
+    """한 줄에 최적 S/F를 적용하고, 절대좌표(G90) 이동이면 Z 깊이를 z_scale배 한 뒤 z_offset만큼 이동합니다."""
     code = strip_comments(line).strip()
     g_codes = code_numbers(parse_words(code), 'G')
     if 90 in g_codes:
@@ -27,18 +32,22 @@ def _rework_line(line, n_val, f_val, z_offset, modal):
         modal['absolute'] = False
     code = S_WORD_RE.sub(f'S{int(n_val)}', code)
     code = F_WORD_RE.sub(f'F{int(f_val)}', code)
-    if z_offset and modal['absolute'] and not set(g_codes) & NON_MOTION_AXIS_CODES:
-        code = Z_WORD_RE.sub(lambda m: f"Z{float(m.group(1)) + z_offset:.3f}", code)
+    if (z_offset or z_scale != 1.0) and modal['absolute'] and not set(g_codes) & NON_MOTION_AXIS_CODES:
+        code = Z_WORD_RE.sub(lambda m: f"Z{_scaled_z(float(m.group(1)), z_scale) + z_offset:.3f}", code)
     return code
 
 
 def create_rework_nc(current_n, current_F, optimal_n, optimal_F, x_pos, y_pos, z_pos, gcode_lines=None,
-                     tolerance_value=0.0, output_path=DEFAULT_REWORK_PATH, safe_z=SAFE_Z_HEIGHT):
+                     tolerance_value=0.0, output_path=DEFAULT_REWORK_PATH, safe_z=SAFE_Z_HEIGHT,
+                     depth_passes=1, note=None):
     """
     최적 절삭 조건으로 rework G-code 파일을 생성합니다.
 
-    1차 패스는 원본 깊이, 2차 패스는 모든 절대좌표 Z를 허용 공차만큼 더 깊게(Z - tolerance) 가공합니다.
+    1차 가공은 원본 깊이를 depth_passes번으로 나눠(예: 2번이면 깊이의 1/2 → 전체 깊이) 가공하고,
+    마지막 패스는 모든 절대좌표 Z를 허용 공차만큼 더 깊게(Z - tolerance) 가공합니다.
+    채터는 절입 깊이에 가장 민감하므로 한 번에 깎는 깊이를 줄이는 것이 회전수·이송 변경보다 확실한 대응입니다.
     각 패스는 안전 높이 상승 → 시작 XY 이동 → 수직 하강 순서로 진입하여 소재 측면 충돌을 막습니다.
+    (G91 상대좌표로 쓴 Z 이동은 깊이를 나눌 수 없어 그대로 둡니다)
 
     Args:
         current_n (float): 현재 스핀들 속도 (RPM).
@@ -52,9 +61,14 @@ def create_rework_nc(current_n, current_F, optimal_n, optimal_F, x_pos, y_pos, z
         tolerance_value (float, optional): Z축 공차 값 (mm, 0 이상). Defaults to 0.0.
         output_path (str, optional): 생성될 rework.nc 파일 경로. Defaults to nc/rework.nc.
         safe_z (float, optional): 진입/복귀 안전 높이 (mm). Defaults to 5.0.
+        depth_passes (int, optional): 원본 깊이를 나눠 가공할 횟수. Defaults to 1.
+        note (str, optional): 파일 첫 줄 주석으로 남길 설명 (조건을 정한 방법 등).
     """
     rework_gcode = []
+    if note:
+        rework_gcode.append(f"({note.replace('(', '[').replace(')', ']')})")
     tolerance_value = max(0.0, float(tolerance_value or 0.0))
+    depth_passes = max(1, int(depth_passes or 1))
     
     # gcode_lines가 None일 경우, 사용자 예시 G-code 사용
     if gcode_lines is None:
@@ -123,8 +137,8 @@ def create_rework_nc(current_n, current_F, optimal_n, optimal_F, x_pos, y_pos, z
         approach.apply(line)
     plunge_x, plunge_y = approach.position[0], approach.position[1]
 
-    def cutting_pass(z_offset):
-        """안전 진입 → 원본 절삭 경로 (z_offset만큼 깊이 보정)"""
+    def cutting_pass(z_offset, z_scale=1.0):
+        """안전 진입 → 원본 절삭 경로 (깊이를 z_scale배 한 뒤 z_offset만큼 보정)"""
         modal = {'absolute': True}
         pass_lines = [
             "G21",
@@ -134,24 +148,24 @@ def create_rework_nc(current_n, current_F, optimal_n, optimal_F, x_pos, y_pos, z
             f"M3 S{int(optimal_n)}",                    # 3. 스핀들 가동
         ]
         for line in before_z_lines_cutting:
-            pass_lines.append(_rework_line(line, optimal_n, optimal_F, z_offset, modal))
+            pass_lines.append(_rework_line(line, optimal_n, optimal_F, z_offset, modal, z_scale))
         # 4. 시작 XY에서 절삭 깊이로 수직 하강
-        pass_lines.append(f"G1 Z{original_z_value + z_offset:.3f} F{int(optimal_F)}")
+        pass_lines.append(f"G1 Z{_scaled_z(original_z_value, z_scale) + z_offset:.3f} F{int(optimal_F)}")
         for line in after_z_lines_cutting:
-            pass_lines.append(_rework_line(line, optimal_n, optimal_F, z_offset, modal))
+            pass_lines.append(_rework_line(line, optimal_n, optimal_F, z_offset, modal, z_scale))
         return pass_lines
-        
-    # --- 첫 번째 가공 경로 생성 (원본 Z 사용) ---
-    rework_gcode.extend(cutting_pass(0.0))
 
-    # --- 중간 안전 복귀 블록 (다음 패스는 안전 높이에서 다시 진입) ---
-    rework_gcode.extend([
-        "M5",
-        f"G0 Z{safe_z:g}",
-        "" # 빈 줄 추가
-    ])
+    # --- 1차 가공: 원본 깊이를 depth_passes번으로 나눠 점점 깊게 (1번이면 원본 깊이 그대로) ---
+    for pass_index in range(1, depth_passes + 1):
+        rework_gcode.extend(cutting_pass(0.0, pass_index / depth_passes))
+        # 중간 안전 복귀 블록 (다음 패스는 안전 높이에서 다시 진입)
+        rework_gcode.extend([
+            "M5",
+            f"G0 Z{safe_z:g}",
+            "" # 빈 줄 추가
+        ])
 
-    # --- 두 번째 가공 경로 생성 (Z에 허용 공차 적용: Z 값을 공차만큼 더 깊게) ---
+    # --- 마지막 패스 (Z에 허용 공차 적용: Z 값을 공차만큼 더 깊게) ---
     rework_gcode.extend(cutting_pass(-tolerance_value))
 
     # --- 최종 안전 복귀/원점 복귀 블록 추가 ---
