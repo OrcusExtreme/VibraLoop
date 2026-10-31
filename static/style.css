@@ -1,0 +1,1984 @@
+/* 전체 페이지 스타일 */
+:root {
+    --main-bg-color: #222831;
+    --secondary-bg-color: #393E46;
+    --accent-color: #00ADB5;
+    --text-color: #EEEEEE;
+    --emergency-color: #FF5252;
+    --warning-color: #FFD740;
+    --success-color: #4CAF50;
+    --primary-bg-color: #222831;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+html, body {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+}
+
+body {
+    background-color: var(--main-bg-color);
+    color: var(--text-color);
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+}
+
+.container {
+    width: 100%;
+    height: 100%;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1vh;
+    overflow: hidden;
+}
+
+h1, h2, h3, h4 {
+    color: var(--accent-color);
+    margin-bottom: 0.5vh;
+}
+
+h1 {
+    font-size: clamp(1.2rem, 2vw, 1.8rem);
+    margin-bottom: 1vh;
+    height: 4vh;
+    min-height: 30px;
+}
+
+h3 {
+    font-size: clamp(0.9rem, 1.5vw, 1.2rem);
+    height: 3vh;
+    min-height: 24px;
+    display: flex;
+    align-items: center;
+}
+
+h4 {
+    font-size: clamp(0.8rem, 1.2vw, 1rem);
+    height: 2.5vh;
+    min-height: 20px;
+    display: flex;
+    align-items: center;
+}
+
+button {
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    padding: 0.5vh 1vw;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    font-size: clamp(0.8rem, 1vw, 1rem);
+}
+
+button:hover {
+    opacity: 0.8;
+}
+
+input, select {
+    background-color: var(--secondary-bg-color);
+    color: var(--text-color);
+    border: 1px solid var(--accent-color);
+    padding: 0.5vh 0.5vw;
+    border-radius: 4px;
+    font-size: clamp(0.8rem, 1vw, 1rem);
+}
+
+/* 새 레이아웃 구조 */
+.top-section {
+    display: flex;
+    flex-direction: column;
+    gap: 1vh;
+    flex-shrink: 0;
+    height: 15vh;
+    min-height: 150px;
+}
+
+.top-frame {
+    display: flex;
+    gap: 1vw;
+    background-color: var(--secondary-bg-color);
+    padding: 1vh 1vw;
+    border-radius: 8px;
+    height: 12vh;
+    min-height: 90px;
+    flex-shrink: 0;
+}
+
+/* 왼쪽 프레임 (포트 제어 + NC 코드) */
+.left-frame {
+    flex: 1;
+    background-color: rgba(0, 0, 0, 0.2);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.combined-controls {
+    display: flex;
+    width: 100%;
+    height: 100%;
+}
+
+.port-section {
+    flex: 1;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 0.5vh;
+    position: relative;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow: hidden; /* 내부 요소가 넘치지 않게 */
+}
+
+.port-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.6vw;
+    flex-wrap: nowrap;
+    width: 100%;
+    min-height: 32px;
+}
+
+.port-controls label {
+    flex: 0 0 auto;
+    font-size: clamp(0.7rem, 0.9vw, 0.95rem);
+    margin-right: 0.3vw;
+    white-space: nowrap;
+}
+
+.port-controls select,
+.port-controls button {
+    flex: 1 1 0;
+    min-width: 0;
+    max-width: 180px;
+    font-size: clamp(0.7rem, 0.9vw, 0.95rem);
+    height: 32px;
+    padding: 0 0.5vw;
+    margin: 0;
+    box-sizing: border-box;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 화면이 작아질 때(1024px 이하) */
+@media (max-width: 1024px) {
+    .port-controls {
+        gap: 0.3vw;
+        min-height: 28px;
+    }
+    .port-controls select,
+    .port-controls button {
+        max-width: 120px;
+        font-size: clamp(0.65rem, 0.8vw, 0.9rem);
+        height: 28px;
+        padding: 0.3em 0.3vw;
+    }
+}
+
+/* 모바일(768px 이하)에서는 세로로 쌓임 */
+@media (max-width: 768px) {
+    .port-controls {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.5vh;
+    }
+    .port-controls label {
+        margin-right: 0;
+        margin-bottom: 0.2em;
+    }
+    .port-controls select,
+    .port-controls button {
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        font-size: clamp(0.7rem, 1.2vw, 1rem);
+        height: 32px;
+        margin: 0;
+    }
+}
+/* NC 코드 영역 스타일 개선 */
+.nc-section {
+    flex: 1;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 0.5vh;
+}
+
+.nc-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.8vw;
+    height: 4vh;
+    min-height: 30px;
+}
+
+/* 오른쪽 프레임 (진행률 + 알람 상태) */
+.right-frame {
+    flex: 1;
+    background-color: rgba(0, 0, 0, 0.2);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.combined-status {
+    display: flex;
+    width: 100%;
+    height: 100%;
+}
+
+.progress-section {
+    flex: 1;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.progress-container {
+    width: 100%;
+    height: 1.5vh;
+    min-height: 15px;
+    background-color: var(--main-bg-color);
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 1vh 0;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.progress-bar {
+    height: 100%;
+    background-color: var(--accent-color);
+    width: 0%;
+    transition: width 0.3s ease;
+    border-radius: 10px;
+}
+
+#progress-text {
+    font-weight: bold;
+    font-size: clamp(0.8rem, 1vw, 0.9rem);
+    text-align: center;
+}
+
+/* 알람 섹션 스타일 개선 */
+.alarm-section {
+    flex: 1;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.alarm-status {
+    color: var(--warning-color);
+    font-weight: bold;
+    margin-top: 1vh;
+    font-size: clamp(0.9rem, 1.2vw, 1.1rem);
+    padding: 0.5vh 0.5vw;
+    border-radius: 4px;
+    background-color: rgba(255, 215, 64, 0.1);
+    border-left: 3px solid var(--warning-color);
+    min-height: 24px;
+    display: flex;
+    align-items: center;
+}
+
+.small-btn {
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    padding: 0.4vh 1vw;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    font-size: clamp(0.75rem, 0.9vw, 0.9rem);
+    margin-top: 0.5vh;
+    align-self: center;
+    width: 100%;
+    max-width: 250px;
+    text-align: center;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 3.5vh;
+    min-height: 28px;
+}
+
+.small-btn:hover {
+    opacity: 0.8;
+}
+
+/* 모달 스타일 */
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+}
+
+.modal-content {
+    position: relative;
+    background-color: var(--secondary-bg-color);
+    margin: 10% auto;
+    padding: 0;
+    border-radius: 8px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+    width: 400px;
+    max-width: 90%;
+    animation: modalIn 0.3s ease-out;
+    border: 1px solid var(--accent-color);
+}
+
+@keyframes modalIn {
+    from {
+        opacity: 0;
+        transform: translateY(-30px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.modal-header {
+    padding: 1.5vh 2vw;
+    background-color: var(--accent-color);
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.modal-header h4 {
+    color: var(--text-color);
+    margin: 0;
+}
+
+.close-modal {
+    color: var(--text-color);
+    font-size: 24px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.close-modal:hover {
+    opacity: 0.8;
+}
+
+.modal-body {
+    padding: 2vh 2vw;
+}
+
+.modal-body .input-group {
+    margin-bottom: 1.5vh;
+}
+
+.modal-body label {
+    display: block;
+    margin-bottom: 0.8vh;
+    font-weight: 500;
+}
+
+.modal-body input {
+    width: 100%;
+    padding: 1vh 1vw;
+    background-color: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--accent-color);
+    color: var(--text-color);
+    border-radius: 4px;
+}
+
+.modal-footer {
+    padding: 1.5vh 2vw;
+    display: flex;
+    justify-content: space-between;
+    gap: 1vw;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    flex-wrap: wrap;
+}
+
+.modal-footer button {
+    padding: 1vh 1vw;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    min-height: 36px;
+    flex: 1;
+    min-width: 80px;
+    max-width: 150px;
+    margin: 0 auto;
+    font-size: clamp(0.75rem, 0.9vw, 0.9rem);
+    white-space: nowrap;
+}
+
+/* 모바일 반응형 스타일 */
+@media (max-width: 768px) {
+    body {
+        padding: 0.5vh 0.5vw;
+        overflow-y: auto;
+    }
+    
+    html, body {
+        overflow-y: auto;
+    }
+    
+    .container {
+        overflow-y: auto;
+    }
+    
+    .top-section {
+        height: auto;
+    }
+    
+    .top-frame {
+        flex-direction: column;
+        height: auto;
+        min-height: 180px;
+    }
+    
+    .left-frame, .right-frame {
+        width: 100%;
+    }
+    
+    .combined-controls, .combined-status {
+        flex-direction: column;
+    }
+    
+    .port-section, .nc-section, .progress-section, .alarm-section, .tool-section {
+        width: 100%;
+        padding: 0.8vh 1.5vw;
+    }
+    
+    .port-controls {
+        flex-direction: column;
+        align-items: flex-start;
+        height: auto;
+    }
+    
+    .nc-controls {
+        flex-direction: column;
+        align-items: flex-start;
+        height: auto;
+    }
+    
+    .port-controls select, .port-controls button, 
+    .nc-controls input, .nc-controls button {
+        width: 100%;
+        margin: 0.3vh 0;
+    }
+    
+    /* 메인 콘텐츠 영역 - 모바일에서는 세로 배치 */
+    .main-content {
+        flex-direction: column;
+        height: auto;
+        min-height: auto;
+    }
+    
+    /* 그래프 프레임과 사이드 패널 너비 조정 */
+    .graph-frame, .side-panel {
+        width: 100%;
+        min-height: 300px;
+    }
+    
+    /* 정보 패널 컨테이너 - 모바일에서는 세로 배치 */
+    .info-panel-container {
+        flex-direction: column;
+    }
+    
+    /* 정보 패널 열 너비 조정 */
+    .info-panel-column {
+        width: 100%;
+    }
+    
+    .info-panel-container {
+        flex-direction: column;
+    }
+    
+    .info-panel-column {
+        width: 100%;
+    }
+    
+    .info-frame, .sensor-frame, .log-frame, .jog-controller-frame {
+        width: 100%;
+        height: auto;
+        min-height: 200px;
+    }
+    
+    .sensor-data, .log-text, .sensor-log-text {
+        min-height: 100px;
+    }
+    
+
+    .sensor-controls {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    
+    .sensor-controls select, 
+    .sensor-controls button {
+        width: 100%;
+        margin: 0.3vh 0;
+    }
+    
+    .combined-status {
+        flex-direction: column;
+    }
+    
+    .tool-section, .progress-section, .alarm-section {
+        width: 100%;
+        padding: 0.8vh 1.5vw;
+    }
+    
+    .vertical-divider {
+        width: 100%;
+        min-width: 0;
+        height: 2px;
+        margin: 1vh 0;
+        background-color: #888;
+        align-self: stretch;
+    }
+    
+    .modal-content {
+        width: 95%;
+        margin: 15% auto;
+    }
+    
+    .vibration-controls {
+        flex-direction: column;
+        height: auto;
+    }
+    
+    .toggle-switch.compact, .small-btn {
+        width: 100%;
+        margin-bottom: 0.5vh;
+    }
+    
+    .modal-footer button {
+        width: 100%;
+        max-width: 100%;
+        margin: 0.3vh 0;
+    }
+    
+    .sensor-controls {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    
+    .sensor-controls label, 
+    .sensor-controls select, 
+    .sensor-controls button {
+        width: 100%;
+        margin: 0.3vh 0;
+    }
+}
+
+/* 이상 진동 감지 관련 스타일 */
+.vibration-automation {
+    margin-top: 0.5vh;
+    flex: 0.4;
+    display: flex;
+    flex-direction: column;
+}
+
+/* 진동 감지 컨트롤 영역 - 한 행 배치 */
+.vibration-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5vw;
+    width: 100%;
+    height: 100%;
+    flex-wrap: nowrap;
+}
+
+/* 더 작은 토글 스위치 */
+.toggle-switch.compact {
+    position: relative;
+    width: auto;
+    height: 2.5vh;
+    min-height: 20px;
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    margin-right: 0.2vw;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3.5vh;
+    min-height: 28px;
+    background-color: #ccc;
+    border-radius: 34px;
+    transition: .4s;
+}
+
+/* 작은 토글 스위치 슬라이더 */
+.compact .toggle-slider {
+    height: 2.5vh;
+    min-height: 20px;
+}
+
+.toggle-slider:before {
+    position: absolute;
+    content: "";
+    height: 80%;
+    aspect-ratio: 1/1;
+    left: 0.3vh;
+    bottom: 0.3vh;
+    background-color: white;
+    border-radius: 50%;
+    transition: .4s;
+}
+
+.toggle-label {
+    position: absolute;
+    left: 4.2vh;
+    top: 0.7vh;
+    font-size: clamp(0.7rem, 0.9vw, 0.9rem);
+    white-space: nowrap;
+}
+
+/* 작은 토글 스위치 라벨 */
+.compact .toggle-label {
+    left: 3.5vh;
+    top: 0.5vh;
+    font-size: clamp(0.6rem, 0.75vw, 0.75rem);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: calc(100% - 4vh);
+}
+
+input:checked + .toggle-slider {
+    background-color: var(--accent-color);
+}
+
+input:checked + .toggle-slider:before {
+    transform: translateX(calc(3.5vh - 0.6vh));
+}
+
+/* 작은 토글 스위치 체크 시 버튼 이동 거리 */
+.compact input:checked + .toggle-slider:before {
+    transform: translateX(calc(2.5vh - 0.6vh));
+}
+
+.small-btn {
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    padding: 0.4vh 0.6vw;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    font-size: clamp(0.65rem, 0.75vw, 0.75rem);
+    text-align: center;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    flex: 0.35;
+    height: 2.5vh;
+    min-height: 20px;
+    max-height: 30px;
+    white-space: nowrap;
+}
+
+.model-section {
+    margin-top: 2vh;
+    border-top: 1px solid #ddd;
+    padding-top: 1vh;
+}
+
+.alert-modal {
+    max-width: 500px;
+}
+
+.alert-header {
+    background-color: var(--emergency-color);
+    color: white;
+}
+
+#recovery-message {
+    margin-top: 1vh;
+    font-weight: bold;
+}
+
+#alert-position {
+    font-family: monospace;
+    background-color: #f0f0f0;
+    padding: 1vh;
+    border-radius: 5px;
+}
+
+/* 실행 버튼 강조 */
+#execute-recovery-btn {
+    background-color: var(--accent-color);
+    color: white;
+    font-weight: bold;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+/* 모달 내부 모든 버튼에 중앙 정렬 적용 */
+.modal button {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+}
+
+/* 모달 내 버튼 전용 스타일 */
+.modal-btn {
+    margin: 0.5vh 0;
+    font-size: clamp(0.75rem, 0.9vw, 0.9rem);
+    padding: 1vh 1vw;
+    width: auto;
+    max-width: none;
+}
+
+/* 모델 학습 버튼 */
+#train-model-btn {
+    margin-top: 1vh;
+    width: 100%;
+    max-width: 150px;
+    align-self: flex-start;
+}
+
+/* 한 행에 배치된 진동 감지 컨트롤 - 라우트 호출 방식 */
+.vibration-controls-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5vw;
+    width: 100%;
+    margin-top: 0.8vh;
+}
+
+/* 진동 상태 */
+.vibration-status {
+    display: flex;
+    align-items: center;
+    gap: 0.3vw;
+    flex: 2; /* 비율 조정 */
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+#vibration-status-text {
+    font-size: clamp(0.65rem, 0.75vw, 0.75rem);
+    white-space: nowrap;
+    color: var(--text-color);
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 이상 진동 버튼 컨테이너 */
+.vibration-buttons {
+    display: flex;
+    gap: 0.5vw;
+    flex: 1; /* 비율 조정 */
+}
+
+/* 이상 진동 버튼 */
+.vibration-btn {
+    padding: 0.4vh 0.3vw;
+    font-size: clamp(0.6rem, 0.7vw, 0.7rem);
+    height: 2.5vh;
+    min-height: 20px;
+    flex: 1; /* 버튼이 균등한 너비를 갖도록 설정 */
+    background-color: var(--accent-color);
+}
+
+#vibration-toggle-btn.active {
+    background-color: var(--success-color);
+}
+
+#vibration-toggle-btn.inactive {
+    background-color: var(--accent-color);
+}
+
+/* 아두이노 센서 데이터 섹션 스타일 */
+.arduino-sensor-section {
+    display: none; /* 더 이상 사용하지 않으므로 숨김 처리 */
+}
+
+/* 제어 버튼 스타일 */
+.control-buttons {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: nowrap;
+    overflow-x: visible;
+    padding-bottom: 0.5vh;
+    width: 100%;
+}
+
+.control-btn {
+    min-width: 0;
+    flex: 1;
+    margin: 0 0.2vw;
+    padding: 1vh 0.2vw;
+    font-size: clamp(0.65rem, 0.8vw, 0.8rem);
+    font-weight: bold;
+    white-space: nowrap;
+    text-align: center;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 첫 번째 버튼은 왼쪽 마진 없음 */
+.control-buttons .control-btn:first-child {
+    margin-left: 0;
+}
+
+/* 마지막 버튼은 오른쪽 마진 없음 */
+.control-buttons .control-btn:last-child {
+    margin-right: 0;
+}
+
+.emergency {
+    background-color: var(--emergency-color);
+}
+
+/* 제어 영역과 진동 감지 영역 사이의 경계선 */
+.control-divider {
+    width: 100%;
+    height: 1px;
+    background-color: var(--accent-color);
+    margin: 0.5vh 0;
+    opacity: 0.5;
+    flex-shrink: 0;
+}
+
+/* 로그 컨트롤 스타일 */
+.log-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1vh;
+    height: 4vh;
+    min-height: 30px;
+    flex-shrink: 0;
+    gap: 1vw;
+}
+
+.log-text {
+    flex: 1;
+    background-color: #1a1a1a;
+    border-radius: 4px;
+    padding: 1vh 1vw;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: clamp(0.7rem, 0.9vw, 0.8rem);
+    line-height: 1.4;
+    color: #DDD;
+    min-height: 150px;
+}
+
+.log-text div {
+    margin-bottom: 0.3vh;
+    word-break: break-word;
+}
+
+/* 로그 토글 스타일 */
+.log-toggle {
+    display: flex;
+    align-items: center;
+    font-size: clamp(0.7rem, 0.9vw, 0.8rem);
+    color: #ccc;
+    margin-left: auto;
+}
+
+.log-toggle input {
+    margin-right: 0.5vw;
+}
+
+.control-btn.small {
+    padding: 0.3vh 0.6vw;
+    font-size: clamp(0.7rem, 0.9vw, 0.8rem);
+    width: auto; /* 글자 길이에 맞게 너비 조정 */
+    min-width: 0; /* 최소 너비 제한 제거 */
+}
+
+/* 센서 데이터 표시 스타일 */
+.sensor-status {
+    display: flex;
+    align-items: center;
+    margin-bottom: 0.8vh;
+}
+
+.sensor-data {
+    display: none;
+}
+
+.sensor-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5vw;
+    flex-wrap: wrap;
+    margin-top: 0.5vh;
+}
+
+.sensor-controls label {
+    margin-right: 0.3vw;
+}
+
+.sensor-controls select {
+    flex: 1;
+    min-width: 100px;
+    font-size: 0.8rem;
+}
+
+.sensor-controls button {
+    padding: 0.4vh 0.6vw;
+}
+
+/* 로그 텍스트 스타일 */
+.log-text .log-info {
+    color: #9ecaff;
+}
+
+.log-text .log-success {
+    color: #85ff9e;
+}
+
+.log-text .log-error {
+    color: #FF5252;
+}
+
+.log-text .log-warning {
+    color: #FFD740;
+}
+
+/* 센서 로그 스타일 추가 */
+.log-text .log-sensor {
+    color: #00E5FF;
+    font-weight: 500;
+    background-color: rgba(0, 229, 255, 0.1);
+    border-left: 3px solid #00E5FF;
+    padding-left: 5px;
+    margin: 2px 0;
+}
+
+/* Jog 버튼 스타일 */
+.jog-buttons {
+    display: flex;
+    gap: 1vw;
+    justify-content: space-between;
+    margin-bottom: 1vh;
+    flex-shrink: 0;
+}
+
+.jog-column {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5vh;
+    flex: 1;
+}
+
+.jog-btn {
+    padding: 1vh 0;
+    font-weight: bold;
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: clamp(0.8rem, 1vw, 0.9rem);
+}
+
+.jog-btn:hover {
+    opacity: 0.8;
+}
+
+.jog-inputs {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8vh;
+}
+
+.jog-inputs .input-group {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.jog-inputs label {
+    flex: 1;
+}
+
+.jog-inputs input {
+    flex: 1;
+    max-width: 90px;
+}
+
+/* 상태 라벨 스타일 */
+.info-label, .status-label, .coordinate-label {
+    background-color: rgba(0, 0, 0, 0.2);
+    padding: 1vh 1vw;
+    border-radius: 4px;
+    font-size: clamp(0.9rem, 1.2vw, 1.1rem);
+    font-weight: bold;
+    height: 6vh;
+    min-height: 50px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.time-info-container {
+    background-color: rgba(0, 0, 0, 0.2);
+    padding: 1vh 1vw;
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5vh;
+    height: 8vh;
+    min-height: 60px;
+    justify-content: center;
+}
+
+.estimated-time {
+    font-weight: bold;
+    color: var(--accent-color);
+    font-size: clamp(0.9rem, 1.2vw, 1.1rem);
+}
+
+.elapsed-time {
+    font-weight: bold;
+    color: var(--warning-color);
+    margin-bottom: 0.5vh;
+    font-size: clamp(0.9rem, 1.2vw, 1.1rem);
+}
+
+/* 버튼 스타일 */
+.small-btn {
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    padding: 0.4vh 1vw;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    font-size: clamp(0.75rem, 0.9vw, 0.9rem);
+    margin-top: 0.5vh;
+    text-align: center;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 3.5vh;
+    min-height: 28px;
+}
+
+/* 포트 상태 표시 개선 */
+#port-status {
+    background-color: var(--main-bg-color);
+    border-radius: 4px;
+    padding: 0.3vh 0.5vw;
+    margin-top: 0.5vh;
+    font-weight: bold;
+    transition: all 0.3s ease;
+    font-size: clamp(0.8rem, 1.1vw, 1rem);
+    min-height: 30px;
+    width: 100%;
+    box-sizing: border-box;
+    display: block;
+    word-break: break-all;
+    white-space: normal;
+    overflow-wrap: break-word;
+    height: auto;           /* 고정 높이 해제, 내용에 따라 자동 */
+    max-height: none;       /* 혹시 있을 max-height 제한 해제 */
+    align-items: unset;     /* flex 해제 시 불필요 */
+    overflow: visible;      /* 내용이 넘쳐도 숨기지 않음 */
+}
+
+#port-status.connected {
+    background-color: rgba(0, 128, 0, 0.2);
+    border-left: 4px solid green;
+    color: #85ff9e;
+}
+
+#port-status.disconnected {
+    background-color: rgba(128, 0, 0, 0.2);
+    border-left: 4px solid red;
+    color: #ff6b6b;
+}
+
+#port-status.connecting {
+    background-color: rgba(255, 166, 0, 0.2);
+    border-left: 4px solid orange;
+    color: #ffde6b;
+    animation: blink 1s infinite alternate;
+}
+
+@keyframes blink {
+    from {
+        opacity: 0.7;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+/* 메인 콘텐츠 영역 (그래프 + 사이드 패널) */
+.main-content {
+    display: flex;
+    flex: 1;
+    gap: 1vw;
+    overflow: hidden;
+    height: calc(85vh - 40px);
+    min-height: 500px;
+}
+
+/* 그래프 프레임 (좌측 50%) */
+.graph-frame {
+    flex: 1;
+    background-color: var(--secondary-bg-color);
+    border-radius: 8px;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* 그래프 컨테이너 */
+.graph-container {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+}
+
+/* 미니 그래프 컨테이너 */
+.mini-graph-container {
+    height: 20%;
+    min-height: 80px;
+    position: relative;
+    margin-top: 1vh;
+}
+
+/* 사이드 패널 (우측 50%) */
+.side-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 1vh;
+    overflow: hidden;
+}
+
+/* 제어 프레임 (사이드 패널 상단) */
+.control-frame-side {
+    background-color: var(--secondary-bg-color);
+    border-radius: 8px;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    height: fit-content;
+    width: 100%; /* 전체 너비로 설정 */
+    float: none; /* float 제거 */
+    margin-bottom: 1vh;
+}
+
+/* 정보 패널 컨테이너 (사이드 패널 하단) */
+.info-panel-container {
+    display: flex;
+    gap: 1vw;
+    flex: 1;
+    overflow: hidden;
+    clear: both; /* float 속성 정리 */
+    margin-top: 0; /* 상단 여백 제거 */
+}
+
+/* 정보 패널 열 (왼쪽 열, 오른쪽 열) */
+.info-panel-column {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 1vh;
+    overflow: hidden;
+}
+
+/* 오른쪽 열 (센서 데이터 프레임과 로그 프레임) */
+.info-panel-column:nth-child(2) {
+    margin-top: 0; /* 센서 프레임이 상단에 짤리지 않도록 수정 */
+}
+
+/* 상태 정보, 센서 데이터, 로그, Jog 컨트롤러 프레임 */
+.info-frame, .sensor-frame, .log-frame, .jog-controller-frame {
+    background-color: var(--secondary-bg-color);
+    border-radius: 8px;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+}
+
+/* 센서 데이터 로그 컨테이너 */
+.sensor-log-container {
+    margin-top: 1vh;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    padding-top: 1vh;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-height: 180px; /* 충분한 높이 확보 */
+}
+
+/* 센서 데이터 로그 텍스트 영역 */
+#sensor-log-text {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 150px;
+}
+
+/* 로그 컨트롤 스타일 */
+.log-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1vh;
+    height: 4vh;
+    min-height: 30px;
+    flex-shrink: 0;
+}
+
+/* 로그 버튼 크기 조정 */
+#clear-log-btn, #clear-sensor-log-btn {
+    width: auto; /* 글자 길이에 맞게 */
+    padding: 0.3vh 1vw;
+}
+
+/* 알람 프레임 깜빡임 효과 설정 */
+@keyframes alarm-blink {
+    0% { background-color: rgba(255, 0, 0, 0.05); }
+    50% { background-color: rgba(255, 0, 0, 0.2); }
+    100% { background-color: rgba(255, 0, 0, 0.05); }
+}
+
+.alarm-blink {
+    animation: alarm-blink 1.5s infinite;
+    border: 1px solid rgba(255, 0, 0, 0.3);
+    box-shadow: 0 0 8px rgba(255, 0, 0, 0.2);
+    transition: background-color 0.3s, box-shadow 0.3s;
+}
+
+/* 알람 상태 프레임 스타일 강화 */
+.alarm-frame {
+    padding: 10px;
+    border-radius: 5px;
+    margin-bottom: 15px;
+    transition: background-color 0.3s, box-shadow 0.3s;
+}
+
+/* 알람 라벨 스타일 개선 */
+#alarm-label {
+    font-weight: bold;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    transition: color 0.3s;
+}
+
+/* 상태 표시 인디케이터 */
+.status-indicator {
+    width: 1.2vh;
+    height: 1.2vh;
+    border-radius: 50%;
+    margin-right: 0.3vw;
+    flex-shrink: 0;
+}
+
+.status-indicator.off {
+    background-color: #ccc;
+    box-shadow: 0 0 3px rgba(0, 0, 0, 0.2);
+}
+
+.status-indicator.on {
+    background-color: var(--success-color);
+    box-shadow: 0 0 5px rgba(76, 175, 80, 0.5);
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7);
+    }
+    70% {
+        box-shadow: 0 0 0 5px rgba(76, 175, 80, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(76, 175, 80, 0);
+    }
+}
+
+/* 센서 로그 타이틀 */
+.sensor-log-container h4 {
+    margin-right: 1vw;
+    white-space: nowrap;
+}
+
+/* 로그 프레임 부분 조정 */
+.log-frame {
+    display: flex;
+    flex-direction: column;
+    flex: 1; /* 비율 유지 */
+}
+
+/* 센서 로그 컨트롤 */
+.sensor-log-container .log-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1vh;
+    height: 4vh;
+    min-height: 30px;
+    flex-shrink: 0;
+}
+
+/* 센서 로그 버튼 스타일 */
+.sensor-log-buttons {
+    display: flex;
+    align-items: center;
+    gap: 0.5vw;
+    margin-left: auto;
+}
+
+.sensor-log-buttons .control-btn.small {
+    padding: 0.3vh 0.6vw;
+    font-size: clamp(0.65rem, 0.75vw, 0.75rem);
+    height: 2.5vh;
+    min-height: 20px;
+    white-space: nowrap;
+}
+sensor-log_text
+.sensor-log-buttons .log-toggle {
+    display: flex;
+    align-items: center;
+    font-size: clamp(0.65rem, 0.75vw, 0.75rem);
+    color: #ccc;
+    margin-left: 0.5vw;
+}
+
+.sensor-log-buttons .log-toggle input {
+    margin-right: 0.3vw;
+    width: 1vh;
+    height: 1vh;
+}
+
+/* 상태 정보 프레임 균등 세로 배치 */
+.info-frame {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between; /* 세로 공간을 균등 분배 */
+    height: 100%; /* 부모 높이 채우기 */
+    min-height: 200px; /* 필요시 최소 높이 지정 */
+    gap: 0; /* 요소 간 간격 제거(원하면 gap: 1vh; 등으로 조정) */
+}
+
+/* 세로 경계선 스타일 */
+.vertical-divider {
+    width: 2px;
+    min-width: 2px;
+    background-color: #888; /* 더 진한 색상으로 변경 */
+    margin: 0 1vw;
+    border-radius: 2px;
+    height: 80%;
+    align-self: center;
+    display: block;
+    /* | 문자처럼 보이도록 */
+    content: "";
+}
+
+/* 모바일 대응 */
+@media (max-width: 768px) {
+    .vertical-divider {
+        width: 100%;
+        min-width: 0;
+        height: 2px;
+        margin: 1vh 0;
+        background-color: #888;
+        align-self: stretch;
+    }
+}
+
+/* GRBL 콘솔 스타일 */
+#grbl-console {
+    margin-top: 10px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    width: 100%;
+}
+
+#grbl-command-input {
+    flex: 3;
+    padding: 8px 12px;
+    font-size: 1rem;
+    border-radius: 4px;
+    border: 1px solid var(--accent-color);
+    background-color: var(--secondary-bg-color);
+    color: var(--text-color);
+    min-width: 0;
+    min-height: 38px;
+}
+
+#grbl-command-send {
+    flex: 1;
+    min-width: 70px;
+    max-width: 120px;
+    padding: 10px 0;
+    font-size: 1rem;
+    border-radius: 4px;
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    cursor: pointer;
+    transition: background 0.2s;
+    min-height: 38px;
+}
+
+#grbl-command-send:hover {
+    background-color: #019ca1;
+}
+
+@media (max-width: 768px) {
+    #grbl-console {
+        flex-direction: column;
+        gap: 6px;
+    }
+    #grbl-command-input, #grbl-command-send {
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+    }
+}
+
+/* Override 컨트롤 스타일 */
+.override-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 1vh;
+    margin-top: 1vh;
+    padding: 1vh;
+    background-color: rgba(0, 0, 0, 0.2);
+    border-radius: 4px;
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+}
+
+.override-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5vh;
+    flex-shrink: 0;
+}
+
+.override-label {
+    font-size: clamp(0.8rem, 1vw, 0.9rem);
+    color: var(--text-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.override-value {
+    font-weight: bold;
+    color: var(--accent-color);
+    min-width: 50px;
+    text-align: right;
+    font-family: monospace;
+    background-color: rgba(0, 0, 0, 0.2);
+    padding: 2px 6px;
+    border-radius: 3px;
+    transition: all 0.3s ease;
+}
+
+.override-slider {
+    width: 100%;
+    height: 4px;
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    background: var(--secondary-bg-color);
+    border-radius: 2px;
+    outline: none;
+    margin: 0.5vh 0;
+}
+
+.override-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    background: var(--accent-color);
+    border-radius: 50%;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.spindle-override-btn-group {
+    display: flex;
+    gap: 8px;
+    margin-top: 0.5vh;
+}
+
+.spindle-override-btn-group .override-btn {
+    flex: 1 1 0;
+    padding: 0.5vh 0;
+    font-size: clamp(0.8rem, 1vw, 0.9rem);
+    font-weight: bold;
+    border-radius: 4px;
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    cursor: pointer;
+    transition: all 0.3s;
+    width: auto;         /* width: 100% 무효화 */
+    margin-top: 0;       /* margin-top 무효화 */
+    min-width: 0;        /* flexbox에서 줄바꿈 방지 */
+}
+
+.spindle-override-btn-group .override-btn:hover {
+    opacity: 0.8;
+}
+
+.override-slider::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+}
+
+.override-slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    background: var(--accent-color);
+    border-radius: 50%;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    border: none;
+}
+
+.override-slider::-moz-range-thumb:hover {
+    transform: scale(1.2);
+}
+
+.override-btn {
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    padding: 0.5vh 1vw;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    font-size: clamp(0.7rem, 0.9vw, 0.8rem);
+    margin-top: 0.5vh;
+    width: 100%;
+}
+
+.override-btn:hover {
+    opacity: 0.8;
+}
+
+/* 모바일 대응 */
+@media (max-width: 768px) {
+    .override-controls {
+        padding: 0.8vh;
+    }
+    
+    .override-value {
+        min-width: 45px;
+        padding: 1px 4px;
+        font-size: 0.9em;
+    }
+    
+    .override-slider {
+        height: 3px;
+    }
+    
+    .override-slider::-webkit-slider-thumb {
+        width: 14px;
+        height: 14px;
+    }
+    
+    .override-slider::-moz-range-thumb {
+        width: 14px;
+        height: 14px;
+    }
+}
+
+/* Jog 컨트롤러 프레임 */
+.jog-controller-frame {
+    background-color: var(--secondary-bg-color);
+    border-radius: 8px;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 300px;
+    max-height: 400px;
+    overflow: hidden;
+}
+
+/* Jog 스텝 설정 영역 */
+.jog-step-inputs {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 1vh;
+}
+
+.jog-step-row {
+    display: flex;
+    align-items: center;
+    gap: 16px; /* XY와 Z 사이 간격 */
+    flex-wrap: wrap;
+}
+
+.jog-step-label {
+    min-width: 80px;
+    font-weight: bold;
+    color: #00ADB5;
+    margin-right: 6px;
+    font-size: 0.98em;
+}
+
+.jog-step-input {
+    width: 70px;
+    padding: 4px 8px;
+    border: 1.5px solid #234;
+    border-radius: 5px;
+    font-size: 1em;
+    color: #234;
+    background: #f8fafc;
+    outline: none;
+    margin-right: 6px;
+}
+
+.jog-step-unit {
+    color: #888;
+    margin-right: 12px;
+    font-size: 0.97em;
+}
+
+.jog-step-gap {
+    display: inline-block;
+    width: 32px; /* XY와 Z 사이 여백 */
+}
+
+@media (max-width: 900px) {
+    .jog-step-row {
+        gap: 8px;
+    }
+    .jog-step-input {
+        width: 55px;
+    }
+}
+
+/* 허용 공차 입력 프레임 반응형 개선 */
+.tool-section {
+    flex: 1;
+    padding: 1vh 1vw;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.5vh;
+    min-width: 0;
+}
+.tolerance-input-group {
+    margin-top: 18px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.tolerance-input {
+    width: 90px;
+    min-width: 60px;
+    padding: 6px 10px;
+    border: 1.5px solid #234;
+    border-radius: 5px;
+    font-size: 1em;
+    color: #234;
+    background: #f8fafc;
+    outline: none;
+}
+
+.tolerance-unit {
+    margin-right: 8px;
+    color: #888;
+    font-size: 1em;
+}
+
+.tolerance-btn {
+    padding: 6px 16px;
+    background: #00ADB5;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    font-size: 1em;
+    cursor: pointer;
+    font-weight: bold;
+    transition: background 0.2s;
+    min-width: 70px;
+}
+.tolerance-btn:hover {
+    background: #019ca1;
+}
+
+.tolerance-btn {
+    padding: 6px 16px;
+    background: #00ADB5;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    font-size: 1em;
+    cursor: pointer;
+    font-weight: bold;
+    transition: background 0.2s;
+}
+.tolerance-btn:hover {
+    background: #019ca1;
+}
+
+/* Zero XY/Z 버튼을 Jog 버튼과 동일하게 */
+.zero-btn {
+    padding: 1vh 0;
+    font-weight: bold;
+    background-color: var(--accent-color);
+    color: var(--text-color);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: clamp(0.8rem, 1vw, 0.9rem);
+    margin-bottom: 0.5vh;
+    width: 100%;
+    transition: all 0.3s;
+}
+.zero-btn:hover {
+    opacity: 0.8;
+}
+/* Zero 버튼이 세로로 쌓이도록(아래로) */
+.jog-column:last-child {
+    flex-direction: column !important;
+    gap: 0.5vh;
+    display: flex;
+    flex: 1;
+    align-items: stretch;
+}
+.jog-column:last-child .zero-btn {
+    margin-bottom: 0;
+}
+
+@media (max-width: 900px) {
+    .tolerance-input-group {
+        gap: 6px;
+    }
+    .tolerance-input {
+        width: 70px;
+        font-size: 0.95em;
+    }
+    .tolerance-btn {
+        font-size: 0.95em;
+        padding: 5px 10px;
+    }
+}
+@media (max-width: 600px) {
+    .tolerance-input-group {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 6px;
+    }
+    .tolerance-btn, .tolerance-input {
+        width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+    }
+}
+
+/* === Vibration Alert & Alert Popup Styles (moved from index.html) === */
+.vibration-alert {
+    display: none;
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background-color: #ff0000;  /* 빨간색 배경 */
+    color: white;  /* 흰색 글자 */
+    padding: 30px;
+    border-radius: 10px;
+    box-shadow: 0 0 20px rgba(0,0,0,0.5);
+    z-index: 1000;
+    text-align: center;
+    animation: pulse 1.5s infinite;
+    min-width: 300px;
+    font-weight: bold;
+}
+
+.vibration-alert.show {
+    display: block;
+}
+
+.vibration-alert h3 {
+    margin: 0 0 15px 0;
+    font-size: 2em;
+}
+
+.vibration-alert p {
+    margin: 0;
+    font-size: 1.5em;
+    line-height: 1.5;
+}
+
+.vibration-alert .buttons {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+}
+
+.vibration-alert button {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 1em;
+    font-weight: bold;
+    transition: background-color 0.2s;
+}
+
+.vibration-alert .stop-btn {
+    background-color: #fff;
+    color: #ff4444;
+}
+
+.vibration-alert .continue-btn {
+    background-color: #444;
+    color: #fff;
+}
+
+/* 이상 진동 알림 스타일 */
+.alert-popup {
+    position: fixed;
+    top: 120px;  /* 상단에서 120px 아래로 이동 */
+    right: 20px;
+    background-color: #fff;
+    border: 2px solid #ff4444;
+    border-radius: 8px;
+    padding: 15px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+    z-index: 1000;
+    min-width: 300px;
+    animation: slideIn 0.3s ease-out;
+}
+
+.alert-content {
+    text-align: center;
+}
+
+.alert-content h3 {
+    color: #ff4444;
+    margin: 0 0 10px 0;
+}
+
+.alert-content p {
+    margin: 10px 0;
+    color: #333;
+}
+
+.alert-buttons {
+    margin-top: 15px;
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+/* === Custom styles moved from index.html inline CSS === */
+.tolerance-area {
+    margin-top: 28px;
+    margin-bottom: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+}
+.tolerance-label {
+    font-weight: bold;
+    font-size: 1.1em;
+    color: #00ADB5;
+    margin-bottom: 8px;
+}
+.tolerance-input-row {
+    display: flex;
+    align-items: center;
+}
+.tolerance-input-box {
+    width: 90px;
+    padding: 6px 10px;
+    border: 1.5px solid #234;
+    border-radius: 5px;
+    font-size: 1em;
+    color: #234;
+    background: #f8fafc;
+    outline: none;
+    margin-right: 10px;
+}
+.tolerance-unit-label {
+    margin-right: 8px;
+    color: #888;
+}
+.tolerance-confirm-btn {
+    padding: 6px 16px;
+    background: #00ADB5;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    font-size: 1em;
+    cursor: pointer;
+    font-weight: bold;
+    transition: background 0.2s;
+}
+.tolerance-confirm-btn:hover {
+    background: #019ca1;
+}
+.grbl-command-input-box {
+    flex: 1;
+    padding: 4px;
+}

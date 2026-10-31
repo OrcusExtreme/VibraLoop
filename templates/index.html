@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>스마트 가공 시스템</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>스마트 가공 시스템</h1>
+        
+        <!-- 상단 프레임 (포트 선택 및 NC 코드 로드) -->
+        <div class="top-section">
+            <div class="top-frame">
+                <!-- 왼쪽: 포트 제어 및 NC 코드 통합 프레임 -->
+                <div class="left-frame">
+                    <div class="combined-controls">
+                        <!-- 포트 제어 영역 -->
+                        <div class="port-section">
+                            <h3>포트 제어</h3>
+                            <div class="port-controls">
+                                <label for="port-select">포트:</label>
+                                <select id="port-select"></select>
+                                <button id="refresh-btn">새로고침</button>
+                                <button id="connect-btn">연결</button>
+                                <button id="disconnect-btn">연결 해제</button>
+                            </div>
+                            <!-- 포트 상태 표시 -->
+                            <div id="port-status" class="disconnected">
+                                포트 상태: 연결되지 않음
+                            </div>
+                        </div>
+                        <!-- 경계선 추가 -->
+                        <div class="vertical-divider"></div>
+                        <!-- NC 코드 영역 -->
+                        <div class="nc-section">
+                            <h3>NC 코드</h3>
+                            <div class="nc-controls">
+                                <input type="file" id="nc-file-input" accept=".nc,.txt">
+                                <button id="load-nc-btn">NC 코드 불러오기</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 오른쪽: 진행률 및 알람 상태 -->
+                <div class="right-frame">
+                    <div class="combined-status">
+                        <!-- 진행률 표시 -->
+                        <div class="progress-section">
+                            <h4>진행률</h4>
+                            <div class="progress-container">
+                                <div id="progress-bar" class="progress-bar"></div>
+                            </div>
+                            <span id="progress-text">0%</span>
+                        </div>
+                        
+                        <div class="vertical-divider"></div>
+                        
+                        <!-- 알람 상태 -->
+                        <div class="alarm-section">
+                            <h4>알람 상태</h4>
+                            <div id="alarm-label" class="alarm-status">
+                                알람 상태 확인중
+                            </div>
+                        </div>
+                        
+                        <div class="vertical-divider"></div>
+                        
+                        <!-- 허용 공차 입력 영역 (왼쪽 정렬) -->
+                        <div class="tolerance-area">
+                            <span class="tolerance-label">허용 공차 입력</span>
+                            <div class="tolerance-input-row">
+                                <input
+                                    type="number"
+                                    id="tolerance"
+                                    value="10"
+                                    min="0"
+                                    step="1"
+                                    class="tolerance-input-box"
+                                />
+                                <span class="tolerance-unit-label">mm</span>
+                                <button id="tolerance-confirm-btn" class="tolerance-confirm-btn">확인</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 메인 콘텐츠 영역 -->
+        <div class="main-content">
+            <!-- 그래프 프레임 (좌측 50%) -->
+            <div class="graph-frame">
+                <h3>가공 경로</h3>
+                <div class="graph-container">
+                    <canvas id="main-chart"></canvas>
+                </div>
+                <div class="mini-graph-container">
+                    <canvas id="z-chart"></canvas>
+                </div>
+            </div>
+
+            <!-- 우측 정보 패널 (우측 50%) -->
+            <div class="side-panel">
+                <!-- 제어 버튼 프레임 (우측 상단) -->
+                <div class="control-frame-side">
+                    <h3>제어</h3>
+                    <div class="control-buttons">
+                        <button id="start-btn" class="control-btn">가공 시작</button>
+                        <button id="pause-btn" class="control-btn">일시정지</button>
+                        <button id="emergency-btn" class="control-btn emergency">긴급정지</button>
+                        <button id="unlock-btn" class="control-btn">알람해제</button>
+                        <button id="save-data-btn" class="control-btn">데이터저장</button>
+                    </div>
+                    
+                    <!-- 경계선 추가 -->
+                    <div class="control-divider"></div>
+                    
+                    <!-- 이상 진동 감지 자동화 기능 -->
+                    <!-- (REMOVED) -->
+                </div>
+                
+                <!-- 2열 패널 컨테이너 -->
+                <div class="info-panel-container">
+                    <!-- 왼쪽 열: 상태 정보와 Jog 컨트롤러 -->
+                    <div class="info-panel-column">
+                        <!-- 상태 정보 프레임 -->
+                        <div class="info-frame">
+                            <h3>상태 정보</h3>
+                            <div id="status-label" class="status-label">
+                                Spindle: - RPM <br> Feed Rate: - mm/min
+                            </div>
+                            <div id="coordinate-label" class="coordinate-label">
+                                현재 위치: X: 0.0, Y: 0.0, Z: 0.0
+                            </div>
+                            <div class="time-info-container">
+                                <div id="estimated-time" class="estimated-time">
+                                    예상 가공 시간: 00:00:00
+                                </div>
+                                <div id="elapsed-time" class="elapsed-time">
+                                    경과 시간: 00:00:00
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Jog 컨트롤러 -->
+                        <div class="jog-controller-frame">
+                            <h3>Jog Controller</h3>
+                            <div class="jog-buttons">
+                                <div class="jog-column">
+                                    <button class="jog-btn" data-axis="x" data-direction="+">X+</button>
+                                    <button class="jog-btn" data-axis="x" data-direction="-">X-</button>
+                                </div>
+                                <div class="jog-column">
+                                    <button class="jog-btn" data-axis="y" data-direction="+">Y+</button>
+                                    <button class="jog-btn" data-axis="y" data-direction="-">Y-</button>
+                                </div>
+                                <div class="jog-column">
+                                    <button class="jog-btn" data-axis="z" data-direction="+">Z+</button>
+                                    <button class="jog-btn" data-axis="z" data-direction="-">Z-</button>
+                                </div>
+                                <div class ="jog-column">
+                                    <button id="zero-xy-btn" class="zero-btn">Zero XY 0</button>
+                                    <button id="zero-z-btn" class="zero-btn">Zero Z 0</button>
+                                </div>
+                            </div>
+                            <div class="jog-step-inputs">
+                            <div class="jog-step-row">
+                                <label for="step-xy-input" class="jog-step-label">Step size XY</label>
+                                <input type="number" id="step-xy-input" class="jog-step-input" value="1.0" min="0.01" step="0.01">
+                                <span class="jog-step-unit">mm</span>
+                                <span class="jog-step-gap"></span>
+                                <label for="step-z-input" class="jog-step-label">Step size Z</label>
+                                <input type="number" id="step-z-input" class="jog-step-input" value="0.2" min="0.01" step="0.01">
+                                <span class="jog-step-unit">mm</span>
+                            </div>
+                        </div>
+                            <div class="override-controls">
+                                <div class="override-group">
+                                    <div class="override-label">
+                                        <span>Spindle Override</span>
+                                        <span class="override-value" id="spindle-override-value">100%</span>
+                                    </div>
+                                    <div class="spindle-override-btn-group">
+                                        <button class="override-btn" id="spindle-override-up">+10%</button>
+                                        <button class="override-btn" id="spindle-override-down">-10%</button>
+                                        <button class="override-btn" id="spindle-override-reset">Reset</button>
+                                    </div>
+                                </div>
+                                <!-- <div class="override-label">
+                                    <span>Spindle Override</span>
+                                    <span class="override-value" id="spindle-override-value">100%</span>
+                                </div>
+                                <input type="range" class="override-slider" id="spindle-override" min="0" max="200" step="10" value="100">
+                                <button class="override-btn" id="set-spindle-override">Spindle Override 설정</button>
+                            </div> -->
+                                <div class="override-group">
+                                    <div class="override-label">
+                                        <span>Feed Override</span>
+                                        <span class="override-value" id="feed-override-value">100%</span>
+                                    </div>
+                                    <input type="range" class="override-slider" id="feed-override" min="0" max="120" step="10" value="100">
+                                    <button class="override-btn" id="set-feed-override">Feed Override 설정</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 오른쪽 열: 센서 데이터 프레임과 로그 프레임 -->
+                    <div class="info-panel-column">
+                        <!-- 센서 데이터 프레임 -->
+                        <div class="sensor-frame">
+                            <h3>센서 데이터</h3>
+                            <div class="sensor-status">
+                                <div id="arduino-status-indicator" class="status-indicator off"></div>
+                                <span id="arduino-status-text">아두이노 센서: 연결되지 않음</span>
+                            </div>
+                            <!-- 센서 포트 제어 UI -->
+                            <div class="sensor-controls">
+                                <select id="sensor-port-select"></select>
+                                <button id="refresh-sensor-port-btn" class="small-btn">새로고침</button>
+                                <button id="connect-sensor-btn" class="small-btn">연결</button>
+                                <button id="disconnect-sensor-btn" class="small-btn" style="display:none;">연결 해제</button>
+                            </div>
+                            <!-- 센서 데이터 로그 영역 추가 -->
+                            <div class="sensor-log-container">
+                                <div class="log-controls">
+                                    <h4>센서 데이터 로그</h4>
+                                    <div class="sensor-log-buttons">
+                                    <button id="clear-sensor-log-btn" class="control-btn small">로그 지우기</button>
+                                        <button id="save-sensor-data-btn" class="control-btn small">센서 데이터 저장</button>
+                                    <div class="log-toggle">
+                                        <input type="checkbox" id="auto-scroll-sensor-log" checked>
+                                        <span>자동 스크롤</span>
+                                    </div>
+                                    </div>
+                                </div>
+                                <div id="sensor-log-text" class="log-text"></div>
+                            </div>
+                        </div>
+                        
+                        <!-- 로그 영역 -->
+                        <div class="log-frame">
+                            <h3>시스템 로그</h3>
+                            <div class="log-controls">
+                                <button id="clear-log-btn" class="control-btn small">로그 지우기</button>
+                                <div class="log-toggle">
+                                    <input type="checkbox" id="auto-scroll-log" checked>
+                                    <span>자동 스크롤</span>
+                                </div>
+                            </div>
+                            <div id="log-text" class="log-text"></div>
+                            <div id="grbl-console">
+                                <input type="text" id="grbl-command-input" placeholder="GRBL 명령어 입력 (예: $X, G0 X10)" class="grbl-command-input-box">
+                                <button id="grbl-command-send" class="control-btn small">전송</button>
+                            </div>  
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    
+    <!-- 이상 진동 감지 설정 모달 -->
+    <div id="vibration-settings-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h4>이상 진동 감지 모델 관리</h4>
+                <span class="close-modal">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="model-section">
+                    <h5>모델 학습</h5>
+                    <p>학습 데이터를 사용하여 이상 진동 감지 모델을 학습합니다.</p>
+                    <div class="input-group">
+                        <label for="train-model-file">학습 데이터 파일 선택:</label>
+                        <input type="file" id="train-model-file" accept=".csv">
+                    </div>
+                    <button id="train-model-btn" class="control-btn modal-btn">모델 학습</button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="reset-vibration-analyzer" class="control-btn modal-btn">감지기 초기화</button>
+                <button id="cancel-vibration-settings" class="control-btn modal-btn">닫기</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 이상 진동 감지 알림 모달 -->
+    <div id="vibration-alert-modal" class="modal">
+        <div class="modal-content alert-modal">
+            <div class="modal-header alert-header">
+                <h4>⚠️ 이상 진동 감지!</h4>
+                <span class="close-modal">&times;</span>
+            </div>
+            <div class="modal-body">
+                <p>가공 중 이상 진동이 감지되었습니다.</p>
+                <p id="alert-position">위치: X: 0.0, Y: 0.0, Z: 0.0</p>
+                <div id="recovery-message"></div>
+            </div>
+            <div class="modal-footer">
+                <button id="execute-recovery-btn" class="control-btn modal-btn">복구 가공 실행</button>
+                <button id="close-alert-btn" class="control-btn modal-btn">닫기</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 이상 진동 감지 알림 -->
+    <div id="vibration-alert" class="vibration-alert">
+        <h3>⚠️ 이상 진동 감지</h3>
+        <p>최적 조건 후가공 프로세스 진행</p>
+    </div>
+    
+    <script src="/static/script.js"></script>
+    <script>
+        // 이상 진동 알림 처리
+        socket.on('vibration_alert', function(data) {
+            const alertPopup = document.getElementById('vibration-alert');
+            
+            if (data.show) {
+                alertPopup.classList.add('show');
+                // 3초 후 자동으로 알림 닫기
+                setTimeout(() => {
+                    alertPopup.classList.remove('show');
+                }, 3000);
+            } else {
+                alertPopup.classList.remove('show');
+            }
+        });
+    </script>
+</body>
+</html>
