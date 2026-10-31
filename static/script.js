@@ -1,5 +1,5 @@
-// 소켓 연결 설정
-let socket = io();
+// 소켓 연결 설정 (initSocketListeners()에서 한 번만 연결)
+let socket = null;
 
 // 차트 설정
 let mainChart, zChart;
@@ -26,14 +26,16 @@ let toolDiameter = null;  // 공구 직경 (초기값 없음)
 let toolFlutes = null;    // 공구 날 수 (초기값 없음)
 
 // 전역 상태 변수
-let currentProcessingState = 'idle'; // idle, running, paused, emergency
+let currentProcessingState = 'idle'; // 서버 state_update 기준: idle, running, paused, emergency, alarm, alarm_unlocked
+let controllerConnected = false;     // CNC 컨트롤러(GRBL) 포트 연결 여부
 
-// 허용 공차 관련 변수
-let toleranceValue = 10; // 기본값 10으로 설정
+// 허용 공차 관련 변수 (서버 초기값 0mm와 일치, 접속 시 서버 값으로 갱신)
+let toleranceValue = 0;
 
 // 센서 데이터 로그 관련 변수 및 함수
 const sensorLogText = document.getElementById('sensor-log-text');
 let sensorLogAutoScroll = true;
+const MAX_SENSOR_LOG_LINES = 500; // 센서는 약 100Hz로 들어오므로 오래된 로그는 삭제
 
 // 센서 데이터 로그에 메시지 추가
 function addSensorLog(message, type = 'info') {
@@ -73,18 +75,19 @@ function addSensorLog(message, type = 'info') {
     
     logEntry.textContent = `[${timestamp}] ${message}`;
     sensorLogText.appendChild(logEntry);
-    
+    while (sensorLogText.children.length > MAX_SENSOR_LOG_LINES) {
+        sensorLogText.removeChild(sensorLogText.firstChild);
+    }
+
     if (sensorLogAutoScroll) {
         sensorLogText.scrollTop = sensorLogText.scrollHeight;
     }
 }
 
-// 페이지 로드 시 초기화
+// 페이지 로드 시 초기화 (DOMContentLoaded는 여기서 한 번만 등록)
 document.addEventListener('DOMContentLoaded', function() {
     try {
         console.log("페이지 로드됨, 초기화 시작");
-        // 소켓 초기화
-        socket = io();
         initPage();
     } catch (error) {
         console.error("초기화 중 오류 발생:", error);
@@ -361,23 +364,57 @@ function initCharts() {
     }
 }
 
-// 차트 업데이트
+// 배열의 최솟값/최댓값 (Math.min(...arr)는 점이 많으면 호출 스택을 넘어 오류가 나므로 직접 계산)
+function minMax(values, extra) {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const v of values) {
+        if (v < min) min = v;
+        if (v > max) max = v;
+    }
+    if (extra !== undefined && extra !== null) {
+        min = Math.min(min, extra);
+        max = Math.max(max, extra);
+    }
+    return [min, max];
+}
+
+// 서버가 보낸 경로 조각을 로컬 경로 배열에 반영 (path_start: 조각이 시작하는 인덱스, 0이면 전체 경로)
+function mergePathUpdate(data) {
+    if (!data.path_x) return true;
+    const start = data.path_start || 0;
+    if (start > xVals.length) {
+        // 중간 조각을 놓친 경우 전체 경로를 다시 요청
+        socket.emit('request_status');
+        return false;
+    }
+    xVals.length = start;
+    yVals.length = start;
+    zVals.length = start;
+    timeVals.length = Math.min(timeVals.length, start);
+    for (let i = 0; i < data.path_x.length; i++) {
+        xVals.push(data.path_x[i]);
+        yVals.push(data.path_y[i]);
+        zVals.push(data.path_z[i]);
+        timeVals.push(totalSeconds);
+    }
+    return true;
+}
+
+// 차트 업데이트 (경로는 전역 xVals/yVals/zVals, 현재 위치는 data.x/y/z)
 function updateCharts(data) {
-    // 데이터 업데이트
-    xVals = data.path_x;
-    yVals = data.path_y;
-    zVals = data.path_z;
-    
+    if (!mainChart || !zChart) return;
+
     // 전체 경로 데이터 표시
     const pathData = xVals.map((x, i) => ({x: x, y: yVals[i]}));
     mainChart.data.datasets[0].data = pathData;
     mainChart.data.datasets[1].data = [{x: data.x, y: data.y}];
-    
+
     // Z 차트 업데이트
     const zLabels = Array.from({length: zVals.length}, (_, i) => i);
     zChart.data.labels = zLabels;
-    zChart.data.datasets[0].data = zVals;
-    
+    zChart.data.datasets[0].data = zVals.slice();
+
     // 현재 Z 위치를 데이터셋에 업데이트
     // 현재 위치를 포인트로 표시하기 위해 가장 마지막 인덱스에 표시
     const currentZIndex = zVals.length - 1;
@@ -385,12 +422,11 @@ function updateCharts(data) {
     if (currentZIndex >= 0) {
         zChart.data.datasets[1].data[currentZIndex] = data.z;
     }
-    
+
     // Z 축 스케일 동적 조정
     if (zVals.length > 1) {
-        const minZ = Math.min(...zVals, data.z);
-        const maxZ = Math.max(...zVals, data.z);
-        
+        const [minZ, maxZ] = minMax(zVals, data.z);
+
         // 최대 절대값 계산 (양수/음수 중 절대값이 더 큰 것)
         const absMaxZ = Math.max(Math.abs(minZ), Math.abs(maxZ));
         const zRange = Math.max(absMaxZ, 5); // 최소 5mm 범위 보장
@@ -403,8 +439,8 @@ function updateCharts(data) {
     
     // 동적 축 범위 설정 (material size 없을 때)
     if (!materialWidth || !materialHeight) {
-        const minX = Math.min(...xVals), maxX = Math.max(...xVals);
-        const minY = Math.min(...yVals), maxY = Math.max(...yVals);
+        const [minX, maxX] = minMax(xVals);
+        const [minY, maxY] = minMax(yVals);
         const padX = (maxX - minX) * 0.1 || 10;
         const padY = (maxY - minY) * 0.1 || 10;
         mainChart.options.scales.x.min = minX - padX;
@@ -412,9 +448,9 @@ function updateCharts(data) {
         mainChart.options.scales.y.min = minY - padY;
         mainChart.options.scales.y.max = maxY + padY;
     }
-    // 차트 업데이트
-    mainChart.update();
-    zChart.update();
+    // 차트 업데이트 (실시간 갱신이므로 애니메이션 없이)
+    mainChart.update('none');
+    zChart.update('none');
 }
 
 // 차트 데이터 초기화
@@ -482,8 +518,8 @@ function resizeCharts() {
     } else {
         // 기존 데이터 범위에 따라 동적 조정
         if (xVals.length > 1) {
-            const minX = Math.min(...xVals), maxX = Math.max(...xVals);
-            const minY = Math.min(...yVals), maxY = Math.max(...yVals);
+            const [minX, maxX] = minMax(xVals);
+            const [minY, maxY] = minMax(yVals);
             const padX = Math.max((maxX - minX) * 0.1, 10);
             const padY = Math.max((maxY - minY) * 0.1, 10);
             
@@ -506,8 +542,7 @@ function resizeCharts() {
         zChart.options.scales.y.min = -maxAbsZ;
         zChart.options.scales.y.max = maxAbsZ; // 최대값과 최소값 비율 동일하게 설정
     } else if (zVals.length > 1) {
-        const minZ = Math.min(...zVals);
-        const maxZ = Math.max(...zVals);
+        const [minZ, maxZ] = minMax(zVals);
         
         // 최대 절대값 계산 (양수/음수 중 절대값이 더 큰 것)
         const absMaxZ = Math.max(Math.abs(minZ), Math.abs(maxZ));
@@ -814,23 +849,11 @@ function initSocketListeners() {
                 updateTimeInfo();
             }
             
-            // 경로 데이터 업데이트
-            if (data.path_x && data.path_x.length > 0) {
-                xVals = data.path_x;
-                yVals = data.path_y;
-                zVals = data.path_z;
-                
-                // 시간 데이터 업데이트 (필요시)
-                if (data.path_x.length > timeVals.length) {
-                    // 새 데이터 포인트에 대한 시간값 추가
-                    while (timeVals.length < data.path_x.length) {
-                        timeVals.push(totalSeconds);
-                    }
-                }
+            // 경로 데이터 업데이트 (서버는 새로 추가된 점만 보내므로 기존 경로에 이어 붙임)
+            if (mergePathUpdate(data)) {
+                // 차트 업데이트
+                updateCharts(data);
             }
-            
-            // 차트 업데이트
-            updateCharts(data);
         });
         
         // 데이터 수신 이벤트
@@ -839,9 +862,48 @@ function initSocketListeners() {
             handleReceivedData(data);
         });
         
-        // 알람 상태 업데이트 수신
+        // 알람 상태 업데이트 수신 (서버가 보낸 문구와 색상을 그대로 표시)
+        // updateAlarmStatus()는 {alarm, state} 형식용이라 {text, color}를 넘기면 알람 중에도 "알람 없음"으로 표시됨
         socket.on('alarm_update', function(data) {
-            updateAlarmStatus(data);
+            const alarmLabel = document.getElementById('alarm-label');
+            if (alarmLabel && data && data.text) {
+                alarmLabel.textContent = data.text;
+                alarmLabel.style.color = data.color || '';
+            }
+        });
+
+        // 서버 가공 상태 수신 (일시정지/시작 버튼 판단의 기준)
+        socket.on('state_update', function(data) {
+            if (!data || !data.state) return;
+            currentProcessingState = data.state;
+            if (data.state !== 'running') {
+                stopProcessingTimer();
+            }
+        });
+
+        // 허용 공차 수신 (입력창을 서버 값과 일치)
+        socket.on('tolerance_update', function(data) {
+            if (!data || typeof data.tolerance !== 'number') return;
+            toleranceValue = data.tolerance;
+            const toleranceInput = document.getElementById('tolerance');
+            if (toleranceInput && document.activeElement !== toleranceInput) {
+                toleranceInput.value = data.tolerance;
+            }
+        });
+
+        // 오버라이드 비율 수신 (GRBL 상태 보고 기준)
+        socket.on('override_status', function(data) {
+            if (!data) return;
+            const spindleLabel = document.getElementById('spindle-override-value');
+            if (spindleLabel && data.spindle !== undefined) {
+                spindleLabel.textContent = `${data.spindle}%`;
+            }
+            const feedLabel = document.getElementById('feed-override-value');
+            const feedSlider = document.getElementById('feed-override');
+            if (data.feed !== undefined) {
+                if (feedLabel) feedLabel.textContent = `${data.feed}%`;
+                if (feedSlider && document.activeElement !== feedSlider) feedSlider.value = data.feed;
+            }
         });
         
         // 상태 업데이트 수신
@@ -910,10 +972,8 @@ function initSocketListeners() {
             }
         });
         
-        // 아두이노 센서 데이터 업데이트
+        // 아두이노 센서 데이터 업데이트 (약 100Hz로 들어오므로 콘솔 출력은 하지 않음)
         socket.on('arduino_data', function(data) {
-            console.log('아두이노 센서 데이터 수신:', data);
-            // `updateArduinoData` 함수가 없으므로 여기에 직접 처리 로직 추가
             handleArduinoSensorData(data.data);
         });
         
@@ -1113,7 +1173,7 @@ function connectPort() {
             }
             
             // 연결 상태 저장
-            isConnected = true;
+            controllerConnected = true;
             localStorage.setItem('lastConnectedPort', port);
         } else {
             // 연결 실패 처리
@@ -1129,8 +1189,8 @@ function connectPort() {
             }
             
             // 연결 상태 변수 초기화
-            isConnected = false;
-            
+            controllerConnected = false;
+
             // 버튼 상태 복원
             connectBtn.textContent = '연결';
             connectBtn.disabled = false;
@@ -1149,7 +1209,8 @@ function updateConnectionStatus(data) {
     const disconnectBtn = document.getElementById('disconnect-btn');
     const portSelect = document.getElementById('port-select');
     const alarmLabel = document.getElementById('alarm-label');
-    
+    controllerConnected = !!data.connected;
+
     if (data.connected) {
         // 연결 상태 처리
         updatePortStatus('connected', data.port);
@@ -1259,13 +1320,13 @@ function initEventListeners() {
     // }
 
     
-    // Spindle Override 버튼 클릭 시 Socket 이벤트 전송
+    // Spindle Override 버튼 클릭 시 Socket 이벤트 전송 (GRBL 1.1 실시간 명령: 0x9A +10%, 0x9B -10%, 0x99 100% 복귀)
     document.getElementById("spindle-override-up").addEventListener("click", () => {
         socket.emit("spindle_override_command", { cmd: "0x9A" });
     });
 
     document.getElementById("spindle-override-down").addEventListener("click", () => {
-        socket.emit("spindle_override_command", { cmd: "0x9C" });
+        socket.emit("spindle_override_command", { cmd: "0x9B" });
     });
 
     document.getElementById("spindle-override-reset").addEventListener("click", () => {
@@ -1274,8 +1335,9 @@ function initEventListeners() {
 
     // 실시간 스핀들 RPM 값 수신해서 화면에 반영
     socket.on("spindle_rpm_update", function (data) {
-        const rpm = data.rpm || "N/A";
-        document.getElementById("spindle-override-value").innerText = `${rpm} RPM`;
+        const rpm = data.rpm ?? "N/A";
+        const override = data.override !== undefined ? `${data.override}% ` : "";
+        document.getElementById("spindle-override-value").innerText = `${override}(${rpm} RPM)`;
     });
 
     if (setFeedOverrideBtn) {
@@ -1481,19 +1543,9 @@ function initEventListeners() {
     });
     
 
-    
-    // 로그 지우기 버튼
-    safeAddEventListener('clear-log-btn', 'click', function() {
-        const logText = document.getElementById('log-text');
-        if (logText) logText.innerHTML = '';
-    });
-    
-    // 자동 스크롤 체크박스
-    safeAddEventListener('auto-scroll-log', 'change', function() {
-        const logAutoScroll = this.checked;
-        localStorage.setItem('logAutoScroll', logAutoScroll);
-    });
-    
+
+    // (로그 지우기 버튼과 자동 스크롤 체크박스는 initLogControls()에서 등록)
+
     // 모달 닫기 버튼
     const closeButtons = document.querySelectorAll('.close-modal');
     closeButtons.forEach(function(btn) {
@@ -1505,18 +1557,21 @@ function initEventListeners() {
     
 
     
-    // 가공 시작 버튼
+    // 가공 시작 버튼 (일시정지 상태에서는 중단된 지점부터 재개)
     safeAddEventListener('start-btn', 'click', function() {
         if (currentProcessingState === 'running') {
             showNotification('이미 가공이 진행 중입니다.', 'warning');
             return;
         }
-        startProcessingTimer();
         socket.emit('start_gcode', {}, function(response) {
             if (response.status === 'success') {
                 currentProcessingState = 'running';
+                // 재개일 때는 경과 시간과 수집 중인 센서 데이터를 초기화하지 않음
+                if (!response.resumed) {
+                    startProcessingTimer();
+                }
                 showNotification(response.message, 'success');
-                addLog('가공을 시작합니다.', 'success');
+                addLog(response.resumed ? '가공을 재개합니다.' : '가공을 시작합니다.', 'success');
                 if (response.estimated_time) {
                     estimatedProcessingTime = response.estimated_time.text;
                 }
@@ -1524,19 +1579,14 @@ function initEventListeners() {
             } else {
                 showNotification(response.message, 'error');
                 addLog(response.message, 'error');
-                stopProcessingTimer();
             }
         });
     });
 
-    // 일시정지 버튼
+    // 일시정지 버튼 (가공 여부는 서버가 판단: 화면 상태가 늦게 갱신되어도 일시정지가 막히지 않도록)
     const pauseButton = document.getElementById('pause-btn');
     if (pauseButton) {
         pauseButton.addEventListener('click', function() {
-            if (currentProcessingState !== 'running') {
-                showNotification('가공 중이 아닐 때는 일시정지를 할 수 없습니다.', 'warning');
-                return;
-            }
             socket.emit('toggle_pause', {}, function(response) {
                 if (response.status === 'success') {
                     currentProcessingState = 'paused';
@@ -1572,17 +1622,18 @@ function initEventListeners() {
 
     // 알람 해제 버튼
     safeAddEventListener('unlock-btn', 'click', function() {
+        const unlockBtn = this;
+        unlockBtn.textContent = '해제 중...';
+        unlockBtn.classList.remove('attention');
         socket.emit('unlock_alarm', {}, function(response) {
+            unlockBtn.textContent = response.button_text || '알람해제';
             if (response.status === 'success') {
                 showNotification(response.message, 'success');
                 addLog(response.message, 'success');
-                const unlockBtn = document.getElementById('unlock-btn');
-                if (unlockBtn && response.button_text) {
-                    unlockBtn.textContent = response.button_text;
-                }
             } else {
                 showNotification(response.message, 'error');
                 addLog(response.message, 'error');
+                unlockBtn.classList.add('attention');
             }
         });
     });
@@ -1599,25 +1650,9 @@ function initEventListeners() {
         .then(data => {
             addLog(data.message, data.status === 'success' ? 'success' : 'error');
             // 원점 설정 후 G54 활성화 및 G0 X0 Y0 이동
+            // (새 원점 좌표는 서버가 position_update로 보내므로 여기서 경로 배열을 직접 바꾸지 않음)
             if (data.status === 'success') {
                 socket.emit('grbl_command', { command: 'G54\nG0 X0 Y0' });
-                // 상태 정보 프레임(현재 위치)도 즉시 원점으로 업데이트
-                xVals.push(0);
-                yVals.push(0);
-                // z는 기존 값 유지
-                const lastZ = zVals.length > 0 ? zVals[zVals.length - 1] : 0;
-                updateCharts({
-                    x: 0,
-                    y: 0,
-                    z: lastZ,
-                    path_x: xVals,
-                    path_y: yVals,
-                    path_z: zVals
-                });
-                const coordinateLabel = document.getElementById('coordinate-label');
-                if (coordinateLabel) {
-                    coordinateLabel.textContent = `현재 위치: X: 0.00, Y: 0.00, Z: ${lastZ.toFixed(2)}`;
-                }
             }
         });
     });
@@ -1633,25 +1668,9 @@ function initEventListeners() {
         .then(data => {
             addLog(data.message, data.status === 'success' ? 'success' : 'error');
             // 원점 설정 후 G54 활성화 및 G0 Z0 이동
+            // (새 원점 좌표는 서버가 position_update로 보내므로 여기서 경로 배열을 직접 바꾸지 않음)
             if (data.status === 'success') {
                 socket.emit('grbl_command', { command: 'G54\nG0 Z0' });
-                // 상태 정보 프레임(현재 위치)도 즉시 원점으로 업데이트
-                // x, y는 기존 값 유지
-                const lastX = xVals.length > 0 ? xVals[xVals.length - 1] : 0;
-                const lastY = yVals.length > 0 ? yVals[yVals.length - 1] : 0;
-                zVals.push(0);
-                updateCharts({
-                    x: lastX,
-                    y: lastY,
-                    z: 0,
-                    path_x: xVals,
-                    path_y: yVals,
-                    path_z: zVals
-                });
-                const coordinateLabel = document.getElementById('coordinate-label');
-                if (coordinateLabel) {
-                    coordinateLabel.textContent = `현재 위치: X: ${lastX.toFixed(2)}, Y: ${lastY.toFixed(2)}, Z: 0.00`;
-                }
             }
         });
     });
@@ -1676,7 +1695,7 @@ function initEventListeners() {
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
             },
-            body: `tolerance=${value}`
+            body: `tolerance=${encodeURIComponent(value)}`
         })
         .then(response => response.json())
         .then(data => {
@@ -1686,6 +1705,8 @@ function initEventListeners() {
                 console.log('설정된 허용 공차 값:', toleranceValue);
                 alert(data.message);
             } else {
+                // 서버가 거부한 값이면 입력창을 현재 서버 값으로 되돌림
+                toleranceInput.value = toleranceValue;
                 alert('오류: ' + data.message);
             }
         })
@@ -1695,38 +1716,6 @@ function initEventListeners() {
         });
     });
 }
-
-    // 허용 공차 확인 버튼 이벤트 리스너
-    safeAddEventListener('tolerance-confirm-btn', 'click', function() {
-        const val = Number(document.getElementById('tolerance').value);
-        console.log('허용 공차 입력값:', val);
-        
-        if (!isNaN(val) && val >= 0) {
-            toleranceValue = val;
-            console.log('허용 공차 값 설정:', toleranceValue);
-            
-            // 서버에 허용 공차 값 전송
-            fetch('/set_tolerance', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: 'tolerance=' + encodeURIComponent(toleranceValue)
-            }).then(res => res.json()).then(data => {
-                console.log('서버 응답:', data);
-                if (data.status === 'success') {
-                    alert("허용 공차가 " + toleranceValue + "mm로 서버에 설정되었습니다.");
-                } else {
-                    alert("허용 공차 설정 실패: " + (data.message || "알 수 없는 오류"));
-                }
-            }).catch(error => {
-                console.error('허용 공차 설정 중 오류:', error);
-                alert('허용 공차 설정 중 오류가 발생했습니다.');
-            });
-        } else {
-            alert("올바른 값을 입력하세요.");
-        }
-    });
-    
-    console.log("이벤트 리스너 초기화 완료");
 
 
 // 알림 표시
@@ -2440,24 +2429,10 @@ function disconnectSensorPort() {
     });
 }
 
-// DOM이 로드되면 초기화 수행
-document.addEventListener('DOMContentLoaded', function() {
-    // 이벤트 리스너 설정
-    setupEventListeners();
-    
-    // 포트 목록 요청
-    requestPortList();
-    
-    // 알람 상태 주기적 확인 설정 (10초마다)
-    setInterval(checkAlarmStatus, 10000);
-
-    
-});
-
 // 알람 상태 확인 함수
 function checkAlarmStatus() {
-    // 연결된 상태일 때만 확인
-    if (isConnected) {
+    // 컨트롤러가 연결된 상태일 때만 확인
+    if (controllerConnected && socket) {
         // 알람 상태 확인 전 UI 업데이트
         const alarmLabel = document.getElementById('alarm-label');
         if (alarmLabel && alarmLabel.textContent === "연결 실패") {
@@ -2495,7 +2470,7 @@ function checkAlarmStatus() {
                 // 연결이 끊어진 것으로 보이면 재연결 유도
                 if (!socket.connected || responseTime > 5000) {
                     updatePortStatus('disconnected');
-                    isConnected = false;
+                    controllerConnected = false;
                     
                     if (alarmLabel) {
                         alarmLabel.textContent = "연결 끊김: 재연결 필요";
@@ -2590,32 +2565,6 @@ function updateAlarmStatus(data) {
     }
 }
 
-// 알람 해제 버튼 클릭 이벤트
-document.getElementById('unlock-btn').addEventListener('click', function() {
-    this.textContent = '해제 중...';
-    this.classList.remove('attention');
-    socket.emit('unlock_alarm', {}, function(response) {
-        const unlockBtn = document.getElementById('unlock-btn');
-        if (unlockBtn) {
-            unlockBtn.textContent = '알람 해제';
-            unlockBtn.classList.remove('disabled');
-        }
-        if (response.status === 'success') {
-            showNotification("알람이 해제되었습니다. 가공을 시작할 수 있습니다.", 'success');
-        } else {
-            showNotification(response.message, 'error');
-            if (unlockBtn) {
-                unlockBtn.classList.add('attention');
-            }
-        }
-    });
-});
-
-// NC 파일 로드 성공 시
-safeAddEventListener('load-nc-btn', 'click', function() {
-    // ... 파일 로드 코드 ...
-});
-
 // 제어 프레임 버튼 이벤트 핸들러
 function initControlButtons() {
     // 가공 시작 버튼
@@ -2709,30 +2658,6 @@ function initControlButtons() {
     }
 }
 
-// 페이지 초기화 시점에만 호출
-document.addEventListener('DOMContentLoaded', function() {
-    initPage();
-    // initEventListeners(); // initPage 내부에서 이미 호출됨
-});
-
-
-
-// 소켓 이벤트 핸들러 설정
-function setupEventListeners() {
-    // ... 기존 코드 ...
-    
-    // 알람 상태 업데이트 이벤트 처리
-    socket.on('alarm_update', function(data) {
-        const alarmLabel = document.getElementById('alarm-label');
-        if (alarmLabel) {
-            alarmLabel.textContent = data.text;
-            alarmLabel.style.color = data.color;
-        }
-    });
-    
-    // ... 기존 코드 ...
-}
-
 // NC 파일 로드 비활성화 함수
 function disableNCFileLoading() {
     // 파일 업로드 관련 요소들
@@ -2780,46 +2705,3 @@ function enableNCFileLoading() {
         }
     }
 }
-
-
-
-document.getElementById('tolerance-confirm-btn').addEventListener('click', function() {
-    const toleranceInput = document.getElementById('tolerance');
-    const value = parseFloat(toleranceInput.value);
-    
-    console.log('입력된 허용 공차 값:', value);
-    
-    if (isNaN(value) || value < 0) {
-        alert('유효한 허용 공차 값을 입력하세요 (0 이상의 숫자)');
-        return;
-    }
-    
-    fetch('/set_tolerance', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: `tolerance=${value}`
-    })
-    .then(response => response.json())
-    .then(data => {
-        console.log('서버 응답:', data);
-        if (data.status === 'success') {
-            toleranceValue = data.tolerance;
-            console.log('설정된 허용 공차 값:', toleranceValue);
-            alert(data.message);
-        } else {
-            alert('오류: ' + data.message);
-        }
-    })
-    .catch(error => {
-        console.error('오류:', error);
-        alert('서버 통신 중 오류가 발생했습니다.');
-    });
-});  
-
-fetch('/set_tolerance', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: 'tolerance=' + encodeURIComponent(toleranceValue)
-});

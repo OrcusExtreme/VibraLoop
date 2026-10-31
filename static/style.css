@@ -1385,7 +1385,7 @@ input:checked + .toggle-slider:before {
     min-height: 20px;
     white-space: nowrap;
 }
-sensor-log_text
+
 .sensor-log-buttons .log-toggle {
     display: flex;
     align-items: center;

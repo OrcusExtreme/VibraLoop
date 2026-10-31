@@ -1,167 +1,76 @@
+"""rework.nc 파일 감시
+
+서버(cnc_app.py) 프로세스 안에서 watchdog으로 nc/rework.nc의 생성·수정을 감지해 콜백을 호출합니다.
+예전처럼 별도 프로세스에서 Socket.IO 클라이언트로 서버에 다시 접속하지 않으므로
+`python watcher.py`를 따로 실행할 필요가 없습니다 (따로 실행하면 재가공이 중복으로 시작될 수 있었음).
+"""
 import os
 import time
+import threading
+import logging
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import subprocess
-import logging
-import socketio
-import json
-import threading
-import requests
 
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+logger = logging.getLogger('watcher')
+
 
 class FileHandler(FileSystemEventHandler):
-    def __init__(self):
-        self.last_modified = time.time()
-        self.processing = False
-        self.sio = None
-        self.connect_socket()
+    """지정한 파일(기본: rework.nc)이 생성·수정·교체(이동)되면 콜백을 호출합니다."""
 
-    def connect_socket(self):
-        """Socket.IO 연결을 시도하고 실패시 재시도"""
-        if self.sio is None:
-            self.sio = socketio.Client(reconnection=True, reconnection_attempts=5, reconnection_delay=5)
-        
-        max_retries = 5
-        retry_count = 0
-        while retry_count < max_retries:
-            try:
-                if not self.sio.connected:
-                    self.sio.connect('http://localhost:5000', wait_timeout=10)
-                    logging.info("Socket.IO 연결 성공")
-                    
-                    # 연결 이벤트 핸들러 등록
-                    @self.sio.on('connect')
-                    def on_connect():
-                        logging.info("Socket.IO 서버에 연결됨")
-                    
-                    @self.sio.on('disconnect')
-                    def on_disconnect():
-                        logging.info("Socket.IO 서버와 연결이 끊어짐")
-                    
-                    return True
-            except Exception as e:
-                retry_count += 1
-                logging.error(f"Socket.IO 연결 실패 (시도 {retry_count}/{max_retries}): {str(e)}")
-                time.sleep(5)  # 5초 대기 후 재시도
-        return False
-
-    def ensure_connection(self):
-        """연결이 끊어졌다면 재연결 시도"""
-        if not self.sio or not self.sio.connected:
-            return self.connect_socket()
-        return True
+    def __init__(self, on_file_ready, filename="rework.nc", debounce_sec=1.0):
+        super().__init__()
+        self.on_file_ready = on_file_ready
+        self.filename = filename
+        self.debounce_sec = debounce_sec
+        self.last_handled = 0.0
+        self.lock = threading.Lock()
 
     def on_created(self, event):
-        if event.is_directory:
-            return
-
-        if os.path.basename(event.src_path) == "Vibration_detection.csv":
-            logging.info("Vibration_detection.csv 생성 감지")
-            try:
-                if not self.ensure_connection():
-                    logging.error("Socket.IO 연결 실패로 인해 명령을 전송할 수 없습니다.")
-                    return
-                
-                # reset_path 이벤트 처리를 위한 Event 객체 생성
-                self.reset_path_completed = threading.Event()
-                
-                def on_reset_path_response(data):
-                    if data.get('status') == 'success':
-                        logging.info("경로 초기화 완료")
-                        self.reset_path_completed.set()  # reset_path 완료 신호
-                    else:
-                        logging.error(f"경로 초기화 실패: {data.get('message', '알 수 없는 오류')}")
-                
-                def on_make_rework_response(data):
-                    if data.get('status') == 'success':
-                        logging.info("rework.nc 생성 성공")
-                    else:
-                        logging.error(f"rework.nc 생성 실패: {data.get('message', '알 수 없는 오류')}")
-                
-                # 경로 초기화 명령 전송
-                self.sio.emit('reset_path', {}, callback=on_reset_path_response)
-                
-                # reset_path 완료 대기 (최대 10초)
-                if self.reset_path_completed.wait(timeout=10.0):
-                    logging.info("경로 초기화 완료 확인, rework.nc 생성 요청 시작")
-                    # Socket.IO 이벤트로 rework.nc 생성 요청
-                    self.sio.emit('make_rework', {}, callback=on_make_rework_response)
-                else:
-                    logging.error("경로 초기화 타임아웃")
-                
-            except Exception as e:
-                logging.error(f"이벤트 처리 중 오류 발생: {str(e)}")
+        self._handle(event, event.src_path)
 
     def on_modified(self, event):
-        if event.is_directory:
-            return
-        
-        if not event.src_path.endswith('.nc'):
-            return
+        self._handle(event, event.src_path)
 
-        current_time = time.time()
-        if current_time - self.last_modified < 1:  # 1초 이내 중복 방지
-            return
+    def on_moved(self, event):
+        # rework.py는 임시 파일에 쓴 뒤 os.replace로 교체하므로 이동 이벤트의 대상 경로를 확인
+        self._handle(event, event.dest_path)
 
-        self.last_modified = current_time
-        
-        if self.processing:
-            logging.info("이전 파일이 아직 처리 중입니다. 대기합니다.")
+    def _handle(self, event, path):
+        if event.is_directory or os.path.basename(path) != self.filename:
             return
-
-        try:
-            self.processing = True
-            logging.info(f"변경된 파일 감지: {event.src_path}")
-            
-            if not self.ensure_connection():
-                logging.error("Socket.IO 연결 실패로 인해 명령을 전송할 수 없습니다.")
+        with self.lock:
+            now = time.time()
+            if now - self.last_handled < self.debounce_sec:  # 한 번 저장할 때 여러 이벤트가 연달아 발생하므로 1회만 처리
                 return
-            
-            # rework.nc 파일이 생성되면 즉시 가공 중지
-            if os.path.basename(event.src_path) == "rework.nc":
-                logging.info("rework.nc 파일 감지 - 새 경로 로드")
-                try:
-                    # 새 경로 로드 명령 전송
-                    self.sio.emit('load_rework_file', {})
-                    logging.info("새 경로 로드 명령 전송 완료")
-                except Exception as e:
-                    logging.error(f"경로 로드 중 오류: {str(e)}")
-                    self.connect_socket()
-            
-        except Exception as e:
-            logging.error(f"파일 처리 중 오류 발생: {str(e)}")
-        finally:
-            self.processing = False
-
-    def __del__(self):
+            self.last_handled = now
+        self._wait_until_stable(path)
+        logger.info(f"{self.filename} 변경 감지: {path}")
         try:
-            if self.sio and self.sio.connected:
-                self.sio.disconnect()
-        except:
-            pass
+            self.on_file_ready(path)
+        except Exception as e:
+            logger.error(f"{self.filename} 처리 중 오류: {e}", exc_info=True)
 
-def main():
-    path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 프로젝트 루트 디렉토리 감시
-    event_handler = FileHandler()
+    @staticmethod
+    def _wait_until_stable(path, timeout=3.0, interval=0.2):
+        """파일 크기가 더 이상 바뀌지 않을 때까지(쓰기가 끝날 때까지) 잠시 기다립니다."""
+        deadline = time.time() + timeout
+        last_size = -1
+        while time.time() < deadline:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = -1
+            if size == last_size and size > 0:
+                return
+            last_size = size
+            time.sleep(interval)
+
+
+def start_rework_watcher(watch_dir, on_rework_ready):
+    """watch_dir(nc 폴더)의 rework.nc를 감시하는 Observer를 시작해 반환합니다."""
+    os.makedirs(watch_dir, exist_ok=True)
     observer = Observer()
-    observer.schedule(event_handler, path, recursive=True)
+    observer.daemon = True
+    observer.schedule(FileHandler(on_rework_ready), watch_dir, recursive=False)
     observer.start()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-        logging.info("감시가 중지되었습니다.")
-    
-    observer.join()
-
-if __name__ == "__main__":
-    main()
+    return observer

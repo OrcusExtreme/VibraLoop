@@ -77,10 +77,12 @@
                                 <input
                                     type="number"
                                     id="tolerance"
-                                    value="10"
+                                    value="0"
                                     min="0"
-                                    step="1"
+                                    max="1"
+                                    step="0.05"
                                     class="tolerance-input-box"
+                                    title="재가공 2차 패스에서 원본 깊이보다 추가로 가공할 깊이 (0 ~ 1mm)"
                                 />
                                 <span class="tolerance-unit-label">mm</span>
                                 <button id="tolerance-confirm-btn" class="tolerance-confirm-btn">확인</button>
@@ -203,7 +205,7 @@
                                         <span>Feed Override</span>
                                         <span class="override-value" id="feed-override-value">100%</span>
                                     </div>
-                                    <input type="range" class="override-slider" id="feed-override" min="0" max="120" step="10" value="100">
+                                    <input type="range" class="override-slider" id="feed-override" min="10" max="120" step="10" value="100">
                                     <button class="override-btn" id="set-feed-override">Feed Override 설정</button>
                                 </div>
                             </div>
@@ -316,22 +318,7 @@
         <p>최적 조건 후가공 프로세스 진행</p>
     </div>
     
+    <!-- 이상 진동 알림(vibration_alert)은 static/script.js의 initSocketListeners()에서 처리 -->
     <script src="/static/script.js"></script>
-    <script>
-        // 이상 진동 알림 처리
-        socket.on('vibration_alert', function(data) {
-            const alertPopup = document.getElementById('vibration-alert');
-            
-            if (data.show) {
-                alertPopup.classList.add('show');
-                // 3초 후 자동으로 알림 닫기
-                setTimeout(() => {
-                    alertPopup.classList.remove('show');
-                }, 3000);
-            } else {
-                alertPopup.classList.remove('show');
-            }
-        });
-    </script>
 </body>
 </html>

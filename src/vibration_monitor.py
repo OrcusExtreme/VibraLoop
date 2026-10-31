@@ -1,17 +1,14 @@
 import numpy as np
 import pandas as pd
 import time
-from flask_socketio import SocketIO
 import sys
 from sklearn.preprocessing import StandardScaler
 from scipy.signal import stft
 from sklearn.neighbors import LocalOutlierFactor
-import tkinter as tk
-from tkinter import messagebox
 import threading
-import queue
 import logging
 import os
+from collections import deque
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
@@ -20,6 +17,9 @@ if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
 from optimizer import CuttingConditionOptimizer # CuttingConditionOptimizer 임포트
 import rework # rework 모듈 임포트
 
+TRAINING_DATA_DIR = os.path.join(BASE_DIR, "data", "학습 데이터")
+MASTER_DATASET_NAME = "master_dataset.csv"
+
 # 진동 모니터 로거 설정
 logger = logging.getLogger('vibration')
 
@@ -27,42 +27,26 @@ class VibrationMonitor:
     def __init__(self, socketio, controllers, gcode_lines=None, tolerance_value=0.0, initial_spindle_override=100):
         self.socketio = socketio
         self.controllers = controllers
-        self.gcode_lines = gcode_lines
+        self.gcode_lines = gcode_lines if gcode_lines is not None else []
         self.tolerance_value = tolerance_value
 
-        self.window_size = 200 # STFT 계산을 위한 데이터 윈도우 크기 (예: 200ms 데이터)
-        self.nperseg = 128 # STFT 세그먼트 당 샘플 수
-        self.noverlap = self.nperseg // 2 # STFT 오버랩 샘플 수
-        self.sampling_rate = 1000 # 1000Hz (1ms 마다 데이터 수신 가정)
-
-        self.sensor_data_buffer = queue.Queue(maxsize=self.window_size)
-        self.last_abnormal_time = None
-        self.MIN_ABNORMAL_DURATION = 1.0 # 1초 이상 이상 진동 지속 시 처리
-        self.is_abnormal = False
-
-        # 현재 디렉토리에 stft_dataset_3axis.csv가 있다고 가정 (train_models.py와 동일)
-        # self.optimizer = CuttingConditionOptimizer(stft_dataset_path) # 더 이상 경로를 전달할 필요 없음
         self.optimizer = CuttingConditionOptimizer()
 
-        # self.scaler1 = StandardScaler()
-        # self.scaler2 = StandardScaler()
-        # self.scaler3 = StandardScaler()
-        # self._fit_scalers_from_dummy_data()
-
-        # VibrationAnalyzer의 __init__ 로직을 직접 통합
+        # 분석 모델 (initialize_analyzer에서 학습)
         self.lof_model = None
         self.scaler1 = StandardScaler()
         self.scaler2 = StandardScaler()
         self.scaler3 = StandardScaler()
-        self.window_size = 100  # 윈도우 크기
-        self.step_size = 25     # 스텝 크기
-        self.fs = 5000  # 샘플링 주파수
+        self.window_size = 100  # 슬라이딩 윈도우 크기 (샘플)
+        self.step_size = 25     # 스텝 크기 (샘플)
+        # 학습 데이터와 MPU6050 펌웨어의 샘플링 주파수(약 100Hz).
+        # STFT 특징값(spectrum 스케일)의 크기는 fs와 무관하며 주파수 축 표기에만 쓰입니다.
+        self.fs = 100
         # RMS/베이스라인 관련
         self.baseline_mean = None
         self.baseline_std = None
         self.rms_threshold_multiplier = 1.5  # baseline 대비 몇 배일 때 이상으로 판단할지
         self.abnormal_count = 0  # 연속된 이상 진동 카운트
-        self.threshold = 0.5     # 이상 진동 판단 임계값 (초 단위)
         self.min_abnormal_ratio = 0.7  # 이상 진동으로 판단하기 위한 최소 비율
         self.is_trained = False # 모델 학습 여부
 
@@ -72,26 +56,18 @@ class VibrationMonitor:
         self.hampel_k = 3       # Hampel window half-size
         self.hampel_threshold = 4.0  # Hampel 변별값 (MAD multiplier)
         # per-axis temporary buffers for smoothing
-        from collections import deque as _dq
-        self._sm_x = _dq(maxlen=self.smooth_window)
-        self._sm_y = _dq(maxlen=self.smooth_window)
-        self._sm_z = _dq(maxlen=self.smooth_window)
+        self._sm_x = deque(maxlen=self.smooth_window)
+        self._sm_y = deque(maxlen=self.smooth_window)
+        self._sm_z = deque(maxlen=self.smooth_window)
         self.sensor_data_buffer = []
-        self.BUFFER_SIZE = 1000  # 버퍼 크기를 1000으로 감소 (약 0.2초 분량의 데이터)
+        self.BUFFER_SIZE = 1000  # 분석 단위 (100Hz 기준 약 10초 분량, 분석 후 절반을 남김)
         self.abnormal_vibration_start_time = None
         self.normal_vibration_start_time = None  # 정상 진동 시작 시간
         self.MIN_ABNORMAL_DURATION = 1.0  # 이상 진동 최소 지속 시간 (초)
         self.MIN_NORMAL_DURATION = 1.0    # 정상 진동 최소 지속 시간 (초)
-        self.last_spindle_adjustment_time = 0
-        self.MIN_SPINDLE_ADJUSTMENT_INTERVAL = 2.0
         self.spindle_override = initial_spindle_override
-        self.MAX_SPINDLE_OVERRIDE = 200
         
-        self.gcode_lines = gcode_lines if gcode_lines is not None else []
-        self.tolerance_value = tolerance_value
         self.is_running = False
-        self.last_analysis_log_time = 0 # 분석 로그 마지막 출력 시간
-        self.log_display_interval = 3.0 # 로그 출력 간격 (3초)
         
         self.initialize_analyzer() # initialize_analyzer는 이제 train_model을 직접 호출함
 
@@ -141,46 +117,55 @@ class VibrationMonitor:
             logger.error(f"특징 추출 중 오류: {e}")
             return [0] * 4  # 오류 발생 시 0으로 채움 (4개 특징)
 
+    def _segment_features(self, df):
+        """정규화된 3축 데이터프레임을 슬라이딩 윈도우로 나눠 윈도우별 12차원 특징을 반환"""
+        segments_s1 = self.sliding_window(self.scaler1.transform(df["AccX"].values.reshape(-1, 1)).flatten())
+        segments_s2 = self.sliding_window(self.scaler2.transform(df["AccY"].values.reshape(-1, 1)).flatten())
+        segments_s3 = self.sliding_window(self.scaler3.transform(df["AccZ"].values.reshape(-1, 1)).flatten())
+        return [
+            self.extract_features(s1) + self.extract_features(s2) + self.extract_features(s3)
+            for s1, s2, s3 in zip(segments_s1, segments_s2, segments_s3)
+        ]
+
     def train_model(self, sensor_data):
-        """모델 학습"""
+        """모델 학습
+
+        sensor_data: (N, 3) 배열 또는 가공 세션별 (N, 3) 배열의 리스트.
+        세션별로 주어지면 서로 다른 세션이 이어 붙은 구간에서 윈도우가 만들어지지 않도록 세션 단위로 분할합니다.
+        """
         try:
-            # 데이터 전처리
-            df = pd.DataFrame(sensor_data, columns=['AccX', 'AccY', 'AccZ'])
+            if isinstance(sensor_data, (list, tuple)) and len(sensor_data) and np.ndim(sensor_data[0]) == 2:
+                sessions = [np.asarray(s, dtype=float)[:, :3] for s in sensor_data]
+            else:
+                sessions = [np.asarray(sensor_data, dtype=float)[:, :3]]
             
-            # 0값 처리 개선
-            df = df.replace([np.inf, -np.inf], np.nan)
-            df = df.ffill()  # 앞의 값으로 채우기 (FutureWarning 해결)
-            df = df.fillna(0)  # 남은 NaN값은 0으로 채움
+            # 데이터 전처리 (inf → NaN → 앞의 값으로 채우기 → 남은 NaN은 0)
+            frames = []
+            for session in sessions:
+                df = pd.DataFrame(session, columns=['AccX', 'AccY', 'AccZ'])
+                df = df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+                frames.append(df)
+            all_df = pd.concat(frames, ignore_index=True)
             
-            # 정규화
-            df["sensor1_norm"] = self.scaler1.fit_transform(df["AccX"].values.reshape(-1, 1)).flatten()
-            df["sensor2_norm"] = self.scaler2.fit_transform(df["AccY"].values.reshape(-1, 1)).flatten()
-            df["sensor3_norm"] = self.scaler3.fit_transform(df["AccZ"].values.reshape(-1, 1)).flatten()
+            # 정규화 (전체 정상 데이터 기준)
+            self.scaler1.fit(all_df["AccX"].values.reshape(-1, 1))
+            self.scaler2.fit(all_df["AccY"].values.reshape(-1, 1))
+            self.scaler3.fit(all_df["AccZ"].values.reshape(-1, 1))
             
-            # 슬라이딩 윈도우 적용
-            segments_s1 = self.sliding_window(df["sensor1_norm"].values)
-            segments_s2 = self.sliding_window(df["sensor2_norm"].values)
-            segments_s3 = self.sliding_window(df["sensor3_norm"].values)
-            
-            # 특징 추출
-            features = np.array([
-                self.extract_features(s1) + self.extract_features(s2) + self.extract_features(s3)
-                for s1, s2, s3 in zip(segments_s1, segments_s2, segments_s3)
-            ])
+            # 슬라이딩 윈도우 적용 및 특징 추출 (세션별)
+            features = []
+            for df in frames:
+                features.extend(self._segment_features(df))
+            features = np.array(features)
             
             # LOF 모델 학습 (contamination 감소)
             self.lof_model = LocalOutlierFactor(n_neighbors=20, contamination=0.1, novelty=True)
             self.lof_model.fit(features)
             
-            logger.info("모델 학습 완료")
+            logger.info(f"모델 학습 완료 (세그먼트 {len(features)}개)")
             self.is_trained = True
             # 학습에 사용한 원본 데이터를 이용해 baseline RMS 계산
-            try:
-                arr = np.array(sensor_data)
-                if arr.ndim == 2 and arr.shape[1] >= 3:
-                    self.calibrate_baseline_from_training(arr[:, :3])
-            except Exception as e:
-                logger.warning(f"학습 후 baseline 계산 중 오류: {e}")
+            self.calibrate_baseline_from_training(np.vstack(sessions))
             return True
             
         except Exception as e:
@@ -200,24 +185,10 @@ class VibrationMonitor:
             df = df.ffill()
             df = df.fillna(0)
             
-            # 정규화
-            df["sensor1_norm"] = self.scaler1.transform(df["AccX"].values.reshape(-1, 1)).flatten()
-            df["sensor2_norm"] = self.scaler2.transform(df["AccY"].values.reshape(-1, 1)).flatten()
-            df["sensor3_norm"] = self.scaler3.transform(df["AccZ"].values.reshape(-1, 1)).flatten()
-            
-            # 슬라이딩 윈도우 적용
-            segments_s1 = self.sliding_window(df["sensor1_norm"].values)
-            segments_s2 = self.sliding_window(df["sensor2_norm"].values)
-            segments_s3 = self.sliding_window(df["sensor3_norm"].values)
-
-            if len(segments_s1) == 0:
+            # 정규화 → 슬라이딩 윈도우 → 특징 추출
+            features = np.array(self._segment_features(df))
+            if len(features) == 0:
                 return False
-
-            # 특징 추출
-            features = np.array([
-                self.extract_features(s1) + self.extract_features(s2) + self.extract_features(s3)
-                for s1, s2, s3 in zip(segments_s1, segments_s2, segments_s3)
-            ])
             
             # LOF 모델을 사용하여 이상치 예측
             predictions = self.lof_model.predict(features)
@@ -293,39 +264,47 @@ class VibrationMonitor:
             return False
 
     def initialize_analyzer(self):
-        """진동 분석기 초기화 및 모델 학습"""
+        """진동 분석기 초기화 및 모델 학습
+
+        data/학습 데이터/master_dataset.csv가 있으면 그 파일만 사용하고, 없으면 같은 폴더의
+        정상 가공 세션 CSV(파일명에 '이상'이 들어간 파일 제외)를 모두 사용합니다.
+        """
         try:
-            normal_data_files = [
-                "master_dataset.csv"
-            ]
+            master_path = os.path.join(TRAINING_DATA_DIR, MASTER_DATASET_NAME)
+            if os.path.exists(master_path):
+                data_files = [master_path]
+            elif os.path.isdir(TRAINING_DATA_DIR):
+                data_files = sorted(
+                    os.path.join(TRAINING_DATA_DIR, name) for name in os.listdir(TRAINING_DATA_DIR)
+                    if name.lower().endswith('.csv') and '이상' not in name
+                )
+            else:
+                data_files = []
             
-            all_normal_data = []
-            base_path = os.path.join(BASE_DIR, "data", "학습 데이터")
-            
-            for file_name in normal_data_files:
-                file_path = os.path.join(base_path, file_name)
+            sessions = []
+            for file_path in data_files:
                 try:
                     logger.info(f"{file_path} 파일 로드 중...")
-                    df = pd.read_csv(file_path)
+                    df = pd.read_csv(file_path, encoding='utf-8-sig')
                     # 필요한 컬럼만 선택 (AccX, AccY, AccZ)
-                    df = df[['AccX', 'AccY', 'AccZ']].values
-                    all_normal_data.extend(df)
-                    logger.info(f"{file_path} 파일 로드 완료 (데이터 수: {len(df)})")
-                except FileNotFoundError:
-                    logger.warning(f"경고: {file_path} 파일을 찾을 수 없습니다.")
-                    continue
+                    values = df[['AccX', 'AccY', 'AccZ']].dropna().values.astype(float)
                 except KeyError as e:
                     logger.warning(f"경고: {file_path} 파일에서 필요한 컬럼을 찾을 수 없습니다. 오류: {e}")
                     continue
+                except Exception as e:
+                    logger.warning(f"경고: {file_path} 파일을 읽을 수 없습니다. 오류: {e}")
+                    continue
+                if len(values) == 0:
+                    continue
+                sessions.append(values)
+                logger.info(f"{file_path} 파일 로드 완료 (데이터 수: {len(values)})")
             
-            if not all_normal_data:
-                raise FileNotFoundError("정상 진동 데이터 파일을 찾을 수 없습니다.")
+            if not sessions:
+                raise FileNotFoundError(f"정상 진동 데이터 파일을 찾을 수 없습니다: {TRAINING_DATA_DIR}")
             
-            normal_data = np.array(all_normal_data)
-            logger.info(f"총 {len(normal_data)}개의 정상 데이터로 학습 시작")
-            logger.debug("initialize_analyzer: train_model 호출 직전")
-            self.train_model(normal_data) # VibrationMonitor 내부의 train_model 호출
-            logger.debug("initialize_analyzer: train_model 호출 직후 및 모델 학습 완료")
+            logger.info(f"총 {len(sessions)}개 파일, {sum(len(s) for s in sessions)}개의 정상 데이터로 학습 시작")
+            if not self.train_model(sessions): # VibrationMonitor 내부의 train_model 호출
+                return False
             logger.info("진동 분석기 초기화 및 모델 학습 완료")
             return True
         except Exception as e:
@@ -400,13 +379,8 @@ class VibrationMonitor:
                     current_abnormal_duration = time.time() - self.abnormal_vibration_start_time
 
                     if current_abnormal_duration >= self.MIN_ABNORMAL_DURATION: # 최소 지속 시간 이상이면 처리
-                        # 이상 진동 감지 즉시 알림은 1회만 (팝업은 handle_abnormal_vibration에서)
+                        # 알림 팝업은 handle_abnormal_vibration에서 1회만 전송
                         if self.abnormal_count == 0: # 첫 감지 시에만 로그
-                            self.socketio.emit('vibration_alert', {
-                                'show': True,
-                                'override': self.spindle_override,
-                                'message': f"⚠️ 이상 진동 감지! 스핀들 속도: {self.spindle_override}%"
-                            })
                             logger.info(f"⚠️ 이상 진동 감지됨 - 모니터링 시작 (지속 시간: {current_abnormal_duration:.2f}초)")
                         
                         self.abnormal_count += 1
@@ -438,197 +412,153 @@ class VibrationMonitor:
             logger.error(f"센서 데이터 처리 중 오류 발생: {str(e)}")
             self.sensor_data_buffer = []  # 오류 발생 시 버퍼 초기화
 
+    def _realtime_stft_features(self):
+        """버퍼의 마지막 윈도우로 실시간 12차원 STFT 특징값을 계산합니다 (데이터가 부족하면 None)."""
+        if not self.is_trained or len(self.sensor_data_buffer) < self.window_size:
+            return None
+        segment = self.sensor_data_buffer[-self.window_size:]
+        df_segment = pd.DataFrame(segment, columns=['AccX', 'AccY', 'AccZ'])
+        df_segment = df_segment.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+
+        s1_norm = self.scaler1.transform(df_segment["AccX"].values.reshape(-1, 1)).flatten()
+        s2_norm = self.scaler2.transform(df_segment["AccY"].values.reshape(-1, 1)).flatten()
+        s3_norm = self.scaler3.transform(df_segment["AccZ"].values.reshape(-1, 1)).flatten()
+
+        # 각 축별 특징 추출 후 결합
+        return np.array(
+            self.extract_features(s1_norm) +
+            self.extract_features(s2_norm) +
+            self.extract_features(s3_norm)
+        )
+
     def handle_abnormal_vibration(self):
-        """이상 진동 발생 시 처리"""
+        """이상 진동 발생 시 처리
+
+        1) 즉시 정지(스트리밍 중단 + GRBL 소프트 리셋)하고 감지 정보를 기록한 뒤,
+        2) 별도 스레드에서 GRBL 복구($X) → 최적 절삭 조건 계산 → rework.nc 생성 순서로 진행합니다.
+           GRBL 복구가 끝난 뒤에 파일을 만들기 때문에, 파일 감시자가 재가공을 시작하는 시점에는
+           컨트롤러가 이미 가공 가능한 상태입니다.
+        """
         logger.info("이상 진동 감지됨")
+        controllers = self.controllers
         
-        # 진동 알림 표시
-        self.socketio.emit('vibration_alert', {
-            'show': True,
-            'override': self.spindle_override,
-            'message': f"⚠️ 이상 진동 감지! 스핀들 속도: {self.spindle_override}%"
-        })
-        
-        # 이상 진동 감지 시 직접 컨트롤러를 통해 일시정지 실행
         try:
-            logger.info(f"[Vibration Handle] 컨트롤러 상태 확인: ser={self.controllers.ser is not None}, is_open={self.controllers.ser.is_open if self.controllers.ser else 'N/A'}, state={self.controllers.state}")
-            if self.controllers.ser and self.controllers.ser.is_open and self.controllers.state == "running":
-                logger.info("[Vibration Handle] 긴급 정지 명령 전송: GRBL 소프트 리셋 (Ctrl-X)")
-                self.controllers.ser.write(b"\x18") # Ctrl-X: GRBL 소프트 리셋 (긴급 정지)
-                self.controllers.ser.flush()
-                time.sleep(0.1)
-
-                logger.info("[Vibration Handle] 컨트롤러 상태 'emergency'로 변경")
-                self.controllers.pause = False # 긴급 정지는 일시정지가 아님
-                self.controllers.state = "emergency"
-                
-                # 진동 탐지 중지
-                if self.controllers.vibration_detection_active:
-                    self.controllers.stop_vibration_detection()
-                    self.socketio.emit('log_update', {"message": "진동 탐지가 중지되었습니다.", "color": "blue"})
-
-                # 일시정지 메시지 표시
-                reason = "이상 진동 감지로 인한 일시정지"
-                self.socketio.emit('log_update', {"message": reason, "color": "orange"})
-                self.socketio.emit('status_update', {"text": "일시정지", "color": "orange"})
-                
-                # Vibration_detection.csv 파일 생성
-                try:
-                    with open(os.path.join(BASE_DIR, 'data', 'Vibration_detection.csv'), 'w') as f:
-                        f.write(f"Abnormal vibration detected at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        f.write(f"Current position: X={self.controllers.x_vals[-1]:.3f}, Y={self.controllers.y_vals[-1]:.3f}, Z={self.controllers.z_vals[-1]:.3f}\n")
-                        f.write(f"Spindle speed: {self.spindle_override}%\n")
-                    logger.info("Vibration_detection.csv 파일이 생성되었습니다.")
-                except Exception as e:
-                    logger.error(f"Vibration_detection.csv 파일 생성 중 오류: {str(e)}")
-                
-                # 최적 절삭 조건 계산 및 rework.nc 생성
-                if self.optimizer and self.controllers.current_spindle is not None and self.controllers.current_feedrate is not None:
-                    logger.info("최적 절삭 조건 계산 시작...")
-                    current_n = self.controllers.current_spindle # 현재 스핀들 속도
-                    current_F = self.controllers.current_feedrate # 현재 이송 속도
-
-                    # 이상 진동 발생 시의 실시간 STFT 특징값 추출 (최근 버퍼 데이터 사용)
-                    if len(self.sensor_data_buffer) >= self.window_size:
-                        # 버퍼의 마지막 윈도우를 사용하여 특징 추출
-                        segment = self.sensor_data_buffer[-self.window_size:]
-                        # 데이터프레임으로 변환 후 정규화
-                        df_segment = pd.DataFrame(segment, columns=['AccX', 'AccY', 'AccZ'])
-                        df_segment = df_segment.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
-                        
-                        s1_norm = self.scaler1.transform(df_segment["AccX"].values.reshape(-1, 1)).flatten()
-                        s2_norm = self.scaler2.transform(df_segment["AccY"].values.reshape(-1, 1)).flatten()
-                        s3_norm = self.scaler3.transform(df_segment["AccZ"].values.reshape(-1, 1)).flatten()
-
-                        # 각 축별 특징 추출 후 결합
-                        realtime_stft_features = (
-                            self.extract_features(s1_norm) +
-                            self.extract_features(s2_norm) +
-                            self.extract_features(s3_norm)
-                        )
-                        realtime_stft_features = np.array(realtime_stft_features)
-
-                        # 잔차 업데이트
-                        self.optimizer.update_residual(realtime_stft_features, current_n, current_F)
-
-                        c0 = {"n": current_n, "F": current_F}
-                        res = self.optimizer.optimize_staged(c0)
-
-                        if res is None:
-                            logger.warning("⚠️ 안전한 최적 절삭 조건을 찾을 수 없습니다.")
-                            self.socketio.emit('log_update', {"message": "⚠️ 안전한 최적 절삭 조건을 찾을 수 없습니다.", "color": "red"})
-                        else:
-                            optimal_c = res["cand"]
-                            optimal_n = optimal_c["n"]
-                            optimal_F = optimal_c["F"]
-                            logger.info(f"✅ 최적 절삭 조건 도출 완료: S={optimal_n:.0f} rpm, F={optimal_F:.1f} mm/min (LOF={res['score']:.3f}, Time Proxy≈{res['time']:.6f})")
-                            self.socketio.emit('log_update', {"message": f"✅ 최적 절삭 조건 도출 완료: S={optimal_n:.0f} rpm, F={optimal_F:.1f} mm/min", "color": "green"})
-
-                            # rework.nc 파일 생성 (기존 함수 재활용)
-                            try:
-                                rework.create_rework_nc(
-                                    current_n,
-                                    current_F,
-                                    optimal_n,
-                                    optimal_F,
-                                    self.controllers.x_vals[-1],
-                                    self.controllers.y_vals[-1],
-                                    self.controllers.z_vals[-1],
-                                    gcode_lines=self.controllers.gcode_lines, # 현재 가공 중인 G-code 라인 전달
-                                    tolerance_value=self.controllers.tolerance_value # 공차 값 전달
-                                )
-                                logger.info("rework.nc 파일이 생성되었습니다.")
-                                self.socketio.emit('log_update', {"message": "rework.nc 파일이 생성되었습니다.", "color": "blue"})
-
-                                # GRBL 긴급 정지 해제 및 알람 해제 시도
-                                if self.controllers.ser and self.controllers.ser.is_open:
-                                    try:
-                                        logger.info("[Vibration Handle] GRBL 소프트 리셋 (Ctrl-X) 명령 전송...")
-                                        self.controllers.ser.write(b"\x18") # Ctrl-X: GRBL 소프트 리셋
-                                        self.controllers.ser.flush()
-                                        time.sleep(2.0) # 리셋 후 부팅 및 초기화 대기 (충분히 길게)
-                                        self.socketio.emit('log_update', {"message": "GRBL 소프트 리셋 명령 전송 완료. 컨트롤러 초기화 대기 중...", "color": "blue"})
-
-                                        logger.info("[Vibration Handle] GRBL 알람 해제 ($X) 명령 전송...")
-                                        self.controllers.ser.write(b"$X\n") # $X: 알람 해제
-                                        self.controllers.ser.flush()
-                                        time.sleep(1.0) # 응답 대기
-                                        self.socketio.emit('log_update', {"message": "GRBL 알람 해제 명령 전송 완료. 상태 확인 중...", "color": "blue"})
-
-                                        # 컨트롤러 상태 업데이트 및 UI 반영
-                                        self.controllers.state = "alarm_unlocked" # 알람 해제 상태로 변경
-                                        self.socketio.emit('status_update', {"text": "알람 해제됨: 재가공 준비 완료", "color": "green"})
-                                        logger.info("[Vibration Handle] GRBL 컨트롤러가 알람 해제 상태로 변경되었습니다.")
-
-                                    except Exception as grbl_e:
-                                        logger.error(f"GRBL 명령 전송 중 오류: {str(grbl_e)}", exc_info=True)
-                                        self.socketio.emit('log_update', {"message": f"⚠️ GRBL 컨트롤러 복구 실패: {str(grbl_e)}", "color": "red"})
-                                else:
-                                    logger.warning("GRBL 시리얼 포트가 연결되지 않아 컨트롤러를 복구할 수 없습니다.")
-                                    self.socketio.emit('log_update', {"message": "⚠️ GRBL 시리얼 포트 연결 없음: 컨트롤러 복구 실패", "color": "red"})
-
-                            except Exception as e:
-                                logger.error(f"rework.nc 파일 생성 중 오류: {str(e)}", exc_info=True)
-                                self.socketio.emit('log_update', {"message": f"⚠️ rework.nc 파일 생성 실패: {str(e)}", "color": "red"})
-                    else:
-                        logger.warning("STFT 특징값 추출을 위한 충분한 센서 데이터가 없습니다.")
-                        self.socketio.emit('log_update', {"message": "STFT 특징값 추출을 위한 충분한 센서 데이터가 없습니다.", "color": "orange"})
-                else:
-                    logger.warning("Optimizer가 초기화되지 않았거나 현재 스핀들/이송 속도 정보를 가져올 수 없습니다.")
-                    self.socketio.emit('log_update', {"message": "Optimizer가 초기화되지 않았거나 현재 스핀들/이송 속도 정보를 가져올 수 없습니다.", "color": "red"})
-                
-                logger.info("이상 진동으로 인한 일시정지 처리 완료")
-        except Exception as e:
-            logger.error(f"이상 진동 처리 중 오류 발생: {str(e)}")
-
-def show_alert():
-    """경고창 표시"""
-    root = tk.Tk()
-    root.withdraw()  # 기본 창 숨기기
-    messagebox.showwarning("경고", "이상 진동이 감지되었습니다!")
-    root.destroy()
-
-def monitor_vibration(sensor_queue, stop_event, tolerance_value):
-    """진동 모니터링"""
-    try:
-        # VibrationMonitor 인스턴스는 cnc_app.py에서 전역으로 관리되어 전달되거나,
-        # 여기서 필요하다면 다시 초기화하여 사용해야 합니다.
-        # 이 함수는 주로 실시간 데이터를 처리하는 역할을 하므로, 모델 학습은 VibrationMonitor 클래스에서 이루어져야 합니다.
+            logger.info(f"[Vibration Handle] 컨트롤러 상태 확인: ser={controllers.ser is not None}, is_open={controllers.ser.is_open if controllers.ser else 'N/A'}, state={controllers.state}")
+            if not (controllers.ser and controllers.ser.is_open and controllers.state == "running"):
+                return
         
-        # cnc_app.py에서 vibration_monitor 인스턴스를 전역으로 가져오는 것이 더 효율적입니다.
-        # 임시로 여기서 VibrationMonitor를 생성하고 학습을 시도합니다.
-        monitor = VibrationMonitor(None, None) # socketio는 None으로 설정
-        
-        # 주의: 이 코드는 monitor_vibration 함수가 VibrationMonitor 클래스와 별개로 작동할 때만 유효합니다.
-        # 만약 cnc_app.py에서 VibrationMonitor 인스턴스를 이미 생성하고 학습했다면 이 부분은 중복입니다.
-        # 여기서는 테스트 목적으로 최소한의 학습을 시뮬레이션합니다.
-        # 실제 구현에서는 이미 학습된 monitor 인스턴스를 사용해야 합니다.
-        # TODO: 실제 센서 데이터를 사용하여 모델 학습
-        # 이 부분은 initialize_analyzer()에서 처리되므로 여기서는 제거합니다.
-        
-        logger.info("진동 모니터링을 시작합니다.")
-        
-        while not stop_event.is_set():
+            # 진동 알림 표시
+            self.socketio.emit('vibration_alert', {
+                'show': True,
+                'override': self.spindle_override,
+                'message': f"⚠️ 이상 진동 감지! 스핀들 속도: {self.spindle_override}%"
+            })
+
+            # 1. 즉시 정지
+            logger.info("[Vibration Handle] 긴급 정지 명령 전송: GRBL 소프트 리셋 (Ctrl-X)")
+            controllers.emergency_halt()
+
+            # 진동 탐지 중지
+            if controllers.vibration_detection_active:
+                controllers.stop_vibration_detection()
+
+            reason = "이상 진동 감지로 인한 긴급정지: 최적 절삭 조건으로 재가공을 준비합니다."
+            self.socketio.emit('log_update', {"message": reason, "color": "orange"})
+            self.socketio.emit('status_update', {"text": "이상 진동 감지: 긴급정지", "color": "orange"})
+
+            # 2. Vibration_detection.csv 파일 생성 (감지 시각/위치 기록)
+            position = (
+                controllers.x_vals[-1] if controllers.x_vals else 0.0,
+                controllers.y_vals[-1] if controllers.y_vals else 0.0,
+                controllers.z_vals[-1] if controllers.z_vals else 0.0,
+            )
             try:
-                # 센서 데이터 가져오기
-                sensor_data = sensor_queue.get(timeout=1.0)
-                
-                # 데이터 분석
-                # VibrationMonitor 인스턴스를 통해 분석 수행
-                is_abnormal = monitor.analyze_realtime_data(sensor_data)
-                
-                if is_abnormal:
-                    # 현재 Z축 위치 확인
-                    # 이 부분은 cnc_app.py의 process_sensor_data에서 처리되므로 여기서는 제거합니다.
-                    pass # 현재는 아무것도 하지 않음
-                
-            except queue.Empty:
-                continue
+                with open(os.path.join(BASE_DIR, 'data', 'Vibration_detection.csv'), 'w', encoding='utf-8') as f:
+                    f.write(f"Abnormal vibration detected at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Current position: X={position[0]:.3f}, Y={position[1]:.3f}, Z={position[2]:.3f}\n")
+                    f.write(f"Spindle speed: {controllers.spindle_override}%\n")
+                logger.info("Vibration_detection.csv 파일이 생성되었습니다.")
             except Exception as e:
-                logger.error(f"데이터 처리 중 오류 발생: {str(e)}")
-                continue
-            
-    except Exception as e:
-        logger.error(f"모니터링 중 오류 발생: {str(e)}")
-    finally:
-        logger.info("진동 모니터링을 종료합니다.") 
+                logger.error(f"Vibration_detection.csv 파일 생성 중 오류: {str(e)}")
+
+            # 3. 감지 시점의 절삭 조건과 실시간 STFT 특징값 확보 (복구 중 버퍼가 바뀌기 전에)
+            current_n, current_F = controllers.effective_cutting_conditions()
+            features = self._realtime_stft_features()
+            source_lines = list(controllers.rework_source_lines or controllers.gcode_lines)
+        except Exception as e:
+            logger.error(f"이상 진동 처리 중 오류 발생: {str(e)}", exc_info=True)
+            return
+
+        # 4. 복구 및 재가공 준비는 센서 수신 스레드를 막지 않도록 별도 스레드에서 수행
+        threading.Thread(
+            target=self._recover_and_create_rework,
+            args=(current_n, current_F, features, position, source_lines),
+            daemon=True
+        ).start()
+
+    def _recover_and_create_rework(self, current_n, current_F, features, position, source_lines):
+        """GRBL 복구($X) → 최적 절삭 조건 계산 → rework.nc 생성"""
+        controllers = self.controllers
+        try:
+            # 4-1. 스트리밍 스레드 종료를 기다린 뒤 GRBL 알람 해제
+            self.socketio.emit('log_update', {"message": "GRBL 소프트 리셋 완료 대기 후 알람을 해제합니다...", "color": "blue"})
+            if not controllers.recover_after_reset():
+                logger.warning("GRBL 컨트롤러를 복구하지 못해 재가공을 진행하지 않습니다.")
+                self.socketio.emit('log_update', {"message": "⚠️ GRBL 컨트롤러 복구 실패: 알람 해제 후 수동으로 재가공하세요.", "color": "red"})
+                return
+            self.socketio.emit('status_update', {"text": "알람 해제됨: 재가공 준비 중", "color": "green"})
+            logger.info("[Vibration Handle] GRBL 컨트롤러가 알람 해제 상태로 변경되었습니다.")
+
+            # 4-2. 최적 절삭 조건 계산
+            if not (self.optimizer and self.optimizer.is_ready()) or current_n is None or current_F is None:
+                logger.warning("Optimizer가 초기화되지 않았거나 현재 스핀들/이송 속도 정보를 가져올 수 없습니다.")
+                self.socketio.emit('log_update', {"message": "Optimizer가 초기화되지 않았거나 현재 스핀들/이송 속도 정보를 가져올 수 없습니다.", "color": "red"})
+                return
+            if features is None:
+                logger.warning("STFT 특징값 추출을 위한 충분한 센서 데이터가 없습니다.")
+                self.socketio.emit('log_update', {"message": "STFT 특징값 추출을 위한 충분한 센서 데이터가 없습니다.", "color": "orange"})
+                return
+                
+            logger.info("최적 절삭 조건 계산 시작...")
+            self.optimizer.update_residual(features, current_n, current_F)
+            res = self.optimizer.optimize_staged({"n": current_n, "F": current_F})
+            if res is None:
+                message = "⚠️ 안전한 최적 절삭 조건을 찾을 수 없습니다. 재가공을 진행하지 않습니다."
+                realtime_score = self.optimizer.lof_score(features)
+                if realtime_score > self.optimizer.tau * 10:
+                    # 실시간 특징 자체가 최적화 모델의 학습 분포에서 크게 벗어나면 모델/특징 계산 방식이 서로 맞지 않는 것
+                    message += (f" (현재 진동 특징의 LOF 점수 {realtime_score:.1f}이(가) 기준 {self.optimizer.tau:.1f}보다 훨씬 커서 "
+                                "models/의 최적화 모델이 현재 센서 데이터와 맞지 않는 것으로 보입니다. "
+                                "현재 센서로 수집한 데이터로 scripts/train_models.py를 다시 학습하세요.)")
+                logger.warning(message)
+                self.socketio.emit('log_update', {"message": message, "color": "red"})
+                return
+
+            optimal_n = res["cand"]["n"]
+            optimal_F = res["cand"]["F"]
+            logger.info(f"✅ 최적 절삭 조건 도출 완료: S={optimal_n:.0f} rpm, F={optimal_F:.1f} mm/min (LOF={res['score']:.3f}, Time Proxy≈{res['time']:.6f})")
+            self.socketio.emit('log_update', {"message": f"✅ 최적 절삭 조건 도출 완료: S={optimal_n:.0f} rpm, F={optimal_F:.1f} mm/min", "color": "green"})
+                
+            # 4-3. rework.nc 생성 → 파일 감시자가 감지하여 재가공 자동 시작 (이번 생성분에 한해 허용)
+            controllers.arm_rework()
+            created = rework.create_rework_nc(
+                current_n,
+                current_F,
+                optimal_n,
+                optimal_F,
+                position[0],
+                position[1],
+                position[2],
+                gcode_lines=source_lines, # 원본 가공 G-code (재가공 파일 자체가 아님)
+                tolerance_value=controllers.tolerance_value # 공차 값 전달
+            )
+            if created:
+                logger.info("rework.nc 파일이 생성되었습니다.")
+                self.socketio.emit('log_update', {"message": "rework.nc 파일이 생성되었습니다.", "color": "blue"})
+            else:
+                controllers.disarm_rework()
+                self.socketio.emit('log_update', {"message": "⚠️ rework.nc 파일 생성 실패", "color": "red"})
+        except Exception as e:
+            controllers.disarm_rework()
+            logger.error(f"재가공 준비 중 오류: {str(e)}", exc_info=True)
+            self.socketio.emit('log_update', {"message": f"⚠️ 재가공 준비 실패: {str(e)}", "color": "red"})

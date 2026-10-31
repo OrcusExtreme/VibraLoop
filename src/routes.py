@@ -1,6 +1,5 @@
 from flask import render_template, request, jsonify, send_from_directory
 import os
-import threading
 import time
 import datetime
 import sys
@@ -12,13 +11,26 @@ if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rework import create_rework_nc
-import requests
+from gcode_utils import parse_words
 import logging
 
 # 전역 변수 선언
 gcode_lines = []
 tolerance_value = 0
 FIXED_SPINDLE = None
+
+# 허용 공차 상한 (mm): 재가공 2차 패스는 원본 Z보다 공차만큼 더 깊게 가공하므로 과절삭·공구 파손을 막기 위해 제한
+MAX_TOLERANCE_MM = 1.0
+# 수동 재가공(/make_rework, make_rework 이벤트) 시 고정 스핀들 속도 (기존 동작 유지)
+MANUAL_REWORK_SPINDLE = 23000
+# 클라이언트 명령 → GRBL 1.1 실시간 Spindle Override 바이트
+SPINDLE_OVERRIDE_COMMANDS = {
+    '0x99': (b'\x99', "Spindle Override Reset"),
+    '0x9A': (b'\x9A', "Spindle Override +10%"),
+    '0x9B': (b'\x9B', "Spindle Override -10%"),
+    '0x9C': (b'\x9C', "Spindle Override +1%"),
+    '0x9D': (b'\x9D', "Spindle Override -1%"),
+}
 
 # 라우트 및 소켓 이벤트 핸들러를 설정하는 함수
 def init_routes(app, socketio, controllers):
@@ -224,7 +236,7 @@ def init_routes(app, socketio, controllers):
     @socketio.on('load_nc_file')
     def handle_load_nc_file(data):
         # 가공 중이거나 일시정지, 긴급정지 상태에서는 NC 코드 로드를 허용하지 않음
-        if controllers.state in ["running", "paused"]:
+        if controllers.state in ["running", "paused"] or controllers.job_active:
             error_msg = "가공 중에는 NC 코드를 로드할 수 없습니다. 가공을 중지한 후 시도하세요."
             socketio.emit('log_update', {"message": error_msg, "color": "red"})
             return {"status": "error", "message": error_msg}
@@ -271,7 +283,6 @@ def init_routes(app, socketio, controllers):
             print("\n[DEBUG] handle_start_gcode 함수 시작", file=sys.stderr)
             print(f"[DEBUG] 현재 상태: {controllers.state}", file=sys.stderr)
             
-            controllers.gcode_current_idx = 0  # 반드시 0으로!
             # 기본 상태 확인
             if not controllers.ser or not controllers.ser.is_open:
                 return {"status": "error", "message": "시리얼 포트가 연결되어 있지 않습니다."}
@@ -282,51 +293,43 @@ def init_routes(app, socketio, controllers):
             if controllers.state == "emergency":
                 return {"status": "error", "message": "긴급정지를 먼저 해제해주세요"}
             
+            # 일시정지 상태에서 재개: 중단된 줄부터 이어서 진행 (처음부터 다시 보내지 않음)
+            if controllers.state == "paused":
+                ok, message = controllers.resume_job()
+                if not ok:
+                    return {"status": "error", "message": message}
+                socketio.emit('log_update', {"message": "가공이 재개되었습니다.", "color": "blue"})
+                socketio.emit('status_update', {"text": "가공 재개", "color": "blue"})
+                return {"status": "success", "message": message, "resumed": True}
+
+            if controllers.job_active:
+                return {"status": "error", "message": "이미 가공이 진행 중입니다."}
+
             if not controllers.gcode_lines:
                 return {"status": "error", "message": "NC 코드가 로드되지 않았습니다."}
 
-            # GRBL 상태 확인
-            try:
-                controllers.ser.reset_input_buffer()
-                controllers.ser.write(b"?\n")
-                controllers.ser.flush()
-                time.sleep(0.3)
-
-                response = controllers.ser.readline().decode('utf-8', errors='ignore').strip()
-                if response:
-                    if "ALARM" in response.upper():
-                        return {"status": "error", "message": "GRBL이 알람 상태입니다. 알람을 해제해주세요."}
-                    elif "ERROR" in response.upper():
-                        return {"status": "error", "message": f"GRBL 오류: {response}"}
-
-            except Exception as e:
-                return {"status": "error", "message": f"GRBL 상태 확인 중 오류: {str(e)}"}
-
-            # 가공 시작/재개 처리
-            if controllers.state == "paused":
-                # 일시정지 상태에서 재개
-                controllers.pause = False
-                controllers.state = "running"
-                socketio.emit('log_update', {"message": "가공이 재개되었습니다.", "color": "blue"})
-                socketio.emit('status_update', {"text": "가공 재개", "color": "blue"})
-            elif controllers.state in ["idle", "alarm_unlocked"]:
-                print("[DEBUG] 가공 시작 조건 충족 (idle 또는 alarm_unlocked 상태)", file=sys.stderr)
-                # 새로운 가공 시작
-                controllers.pause = False
-                controllers.x_vals = [0]
-                controllers.y_vals = [0]
-                controllers.z_vals = [0]
-                controllers.progress = 0
-                socketio.emit('log_update', {"message": "가공을 시작합니다.", "color": "blue"})
-                socketio.emit('status_update', {"text": "가공 시작", "color": "blue"})
-            else:
+            if controllers.state not in ["idle", "alarm_unlocked"]:
                 return {"status": "error", "message": "현재 상태에서는 가공을 시작할 수 없습니다."}
 
-            # 가공 스레드 시작
-            print("[DEBUG] 가공 스레드 시작", file=sys.stderr)
+            # GRBL 상태 확인
+            try:
+                status = controllers.query_status(timeout=0.5)
+            except Exception as e:
+                return {"status": "error", "message": f"GRBL 상태 확인 중 오류: {str(e)}"}
+            if status and status['state'] == "Alarm":
+                return {"status": "error", "message": "GRBL이 알람 상태입니다. 알람을 해제해주세요."}
+            if status and status['state'] in ("Run", "Hold", "Jog", "Door"):
+                return {"status": "error", "message": f"GRBL이 아직 동작 중이거나 일시정지 상태입니다 ({status['state']})."}
+
+            # 새로운 가공 시작 (스트리밍 스레드 시작)
+            print("[DEBUG] 가공 시작 조건 충족 (idle 또는 alarm_unlocked 상태)", file=sys.stderr)
+            ok, message = controllers.start_job()
+            if not ok:
+                return {"status": "error", "message": message}
+            socketio.emit('log_update', {"message": "가공을 시작합니다.", "color": "blue"})
+            socketio.emit('status_update', {"text": "가공 시작", "color": "blue"})
             socketio.emit('disable_nc_upload', {})
-            threading.Thread(target=controllers.send_gcode, daemon=True).start()
-            return {"status": "success", "message": "가공이 시작되었습니다."}
+            return {"status": "success", "message": message}
 
         except Exception as e:
             error_msg = f"가공 시작 중 오류 발생: {str(e)}"
@@ -335,30 +338,18 @@ def init_routes(app, socketio, controllers):
 
     @socketio.on('toggle_pause')
     def handle_toggle_pause(data=None):
-        """일시정지 처리"""
+        """일시정지 처리 (피드 홀드 후 스트리밍 스레드는 응답을 읽으며 재개를 기다림)"""
         try:
             if not controllers.ser or not controllers.ser.is_open:
                 return {"status": "error", "message": "시리얼 포트가 연결되어 있지 않습니다."}
 
-            if controllers.state != "running":
-                return {"status": "error", "message": "가공 중이 아닐 때는 일시정지를 할 수 없습니다."}
-
-            # 피드 홀드 명령 전송
-            controllers.ser.write(b"!")
-            controllers.ser.flush()
-            time.sleep(0.1)
-
-            # 일시정지 상태로 변경
-            controllers.pause = True
-            controllers.state = "paused"
-            
-            # 진동 탐지 중지
-            if controllers.vibration_detection_active:
-                controllers.stop_vibration_detection()
-                socketio.emit('log_update', {"message": "진동 탐지가 중지되었습니다.", "color": "blue"})
+            # 피드 홀드 명령 전송, 일시정지 상태로 변경, 진동 탐지 중지
+            ok, message = controllers.pause_job()
+            if not ok:
+                return {"status": "error", "message": message}
 
             # 일시정지 메시지 표시
-            reason = data.get('reason', '가공이 일시정지되었습니다.')
+            reason = (data or {}).get('reason', '가공이 일시정지되었습니다.')
             socketio.emit('log_update', {"message": reason, "color": "orange"})
             socketio.emit('status_update', {"text": "일시정지", "color": "orange"})
             return {"status": "success", "message": reason}
@@ -376,26 +367,24 @@ def init_routes(app, socketio, controllers):
                 return {"status": "error", "message": "시리얼 포트가 연결되어 있지 않습니다."}
 
             if controllers.state == "emergency":
-                # 긴급정지 해제: 소프트 리셋(CTRL+X) 후 상태 확인
-                controllers.ser.reset_input_buffer()
-                controllers.ser.reset_output_buffer()
-                controllers.ser.write(b"\x18")  # Ctrl+X (소프트 리셋)
-                controllers.ser.flush()
-                time.sleep(0.3)
+                # 긴급정지 해제: 스트리밍 스레드 종료를 기다린 뒤 소프트 리셋(CTRL+X) 후 상태 확인
+                deadline = time.time() + 3.0
+                while controllers.job_active and time.time() < deadline:
+                    time.sleep(0.05)
+                with controllers.ser_lock:
+                    controllers.ser.reset_input_buffer()
+                    controllers.ser.reset_output_buffer()
+                    controllers.ser.write(b"\x18")  # Ctrl+X (소프트 리셋)
+                    controllers.ser.flush()
+                time.sleep(1.0)  # 리셋 후 GRBL 초기화 대기
 
-                # 알람 상태 확인
-                controllers.ser.write(b"?\n")
-                controllers.ser.flush()
-                time.sleep(0.2)
-
-                alarm_detected = False
-                if controllers.ser.in_waiting > 0:
-                    response = controllers.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if "ALARM" in response.upper():
-                        alarm_detected = True
+                # 알람 상태 확인 (리셋 직후 출력되는 시작 메시지가 아니라 상태 보고로 판단)
+                status = controllers.query_status()
+                alarm_detected = bool(status and status['state'] == "Alarm")
 
                 controllers.state = "alarm" if alarm_detected else "idle"
                 controllers.pause = False
+                controllers.notify_state()
 
                 if alarm_detected:
                     socketio.emit('log_update', {"message": "긴급정지 해제 완료! 알람 상태가 감지되었습니다.", "color": "orange"})
@@ -411,45 +400,17 @@ def init_routes(app, socketio, controllers):
                     return {"status": "success", "message": "긴급정지가 해제되었습니다", "button_text": "긴급정지"}
 
             else:
-                # 긴급정지 활성화: 스핀들/피드 즉각 정지, G코드 전송 중단, 소프트 리셋
-                controllers.pause = True
-                controllers.state = "emergency"
-                controllers.stop_csv_logging()
+                # 긴급정지 활성화: G코드 전송 중단 + 소프트 리셋(CTRL+X)으로 스핀들/이송 즉시 정지
+                # (M5 같은 일반 명령은 GRBL 버퍼에 쌓인 이동 뒤에 실행되므로 즉시 정지에는 소프트 리셋을 사용)
+                controllers.emergency_halt()
 
-                # 스핀들/피드 즉각 정지
-                try:
-                    controllers.ser.write(b"M5\n")  # 스핀들 정지
-                    controllers.ser.flush()
-                    time.sleep(0.05)
-                    controllers.ser.write(b"F0\n")  # 피드 0
-                    controllers.ser.flush()
-                    time.sleep(0.05)
-                except Exception as e:
-                    socketio.emit('log_update', {"message": f"스핀들/피드 정지 명령 오류: {str(e)}", "color": "red"})
-
-                # 소프트 리셋(CTRL+X)로 모든 동작 즉시 정지
-                controllers.ser.write(b"\x18")
-                controllers.ser.flush()
-                time.sleep(0.3)
-
-                socketio.emit('log_update', {"message": "긴급정지 실행! 스핀들/피드 즉시 정지 및 소프트 리셋(CTRL+X)로 즉시 정지.", "color": "red"})
+                socketio.emit('log_update', {"message": "긴급정지 실행! 소프트 리셋(CTRL+X)으로 스핀들/이송을 즉시 정지했습니다.", "color": "red"})
                 socketio.emit('status_update', {"text": "긴급정지", "color": "red"})
                 socketio.emit('alarm_update', {'text': "긴급정지 상태", 'color': 'red'})
                 socketio.emit('disable_nc_upload', {})
 
                 # 경로 및 상태 즉시 반영
-                socketio.emit('position_update', {
-                    'x': controllers.x_vals[-1] if controllers.x_vals else 0,
-                    'y': controllers.y_vals[-1] if controllers.y_vals else 0,
-                    'z': controllers.z_vals[-1] if controllers.z_vals else 0,
-                    'path_x': controllers.x_vals,
-                    'path_y': controllers.y_vals,
-                    'path_z': controllers.z_vals,
-                    'spindle': 0,
-                    'feedrate': 0,
-                    'progress': controllers.progress,
-                    'state': controllers.state
-                })
+                controllers.update_ui()
 
                 return {"status": "success", "message": "긴급정지가 활성화되었습니다", "button_text": "긴급정지 해제"}
 
@@ -464,44 +425,49 @@ def init_routes(app, socketio, controllers):
         try:
             if not controllers.ser or not controllers.ser.is_open:
                 return {"status": "error", "message": "시리얼 포트가 연결되어 있지 않습니다."}
+            if controllers.job_active:
+                return {"status": "error", "message": "가공 중에는 알람을 해제할 수 없습니다."}
 
-            # 알람 상태 확인
-            controllers.ser.reset_input_buffer()
-            controllers.ser.write(b"?\n")
-            controllers.ser.flush()
-            time.sleep(0.5)
+            with controllers.ser_lock:
+                # 알람 상태 확인 (실시간 명령 '?'는 개행 없이 전송해야 추가 'ok' 응답이 생기지 않음)
+                controllers.ser.reset_input_buffer()
+                controllers.ser.write(b"?")
+                controllers.ser.flush()
+                time.sleep(0.5)
 
-            alarm_state = False
-            if controllers.ser.in_waiting > 0:
-                response = controllers.ser.readline().decode('utf-8', errors='ignore').strip()
-                if "ALARM" in response.upper():
-                    alarm_state = True
-
-            if not alarm_state and controllers.state != "alarm":
-                socketio.emit('log_update', {"message": "알람 상태가 아닙니다.", "color": "green"})
-                socketio.emit('alarm_update', {'text': "알람 없음", 'color': 'green'})
-                socketio.emit('status_update', {"text": "정상 상태", "color": "green"})
-                socketio.emit('enable_nc_upload', {})
-                return {"status": "success", "message": "알람 상태가 아닙니다."}
-
-            # 알람 해제 명령 전송
-            controllers.ser.write(b"$X\n")
-            controllers.ser.flush()
-            time.sleep(0.5)
-
-            # 응답 확인
-            unlock_success = False
-            start_time = time.time()
-            while time.time() - start_time < 1.0:
+                alarm_state = False
                 if controllers.ser.in_waiting > 0:
                     response = controllers.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if "ok" in response.lower():
-                        unlock_success = True
-                        break
-                time.sleep(0.05)
+                    if "ALARM" in response.upper():
+                        alarm_state = True
+
+                if not alarm_state and controllers.state != "alarm":
+                    socketio.emit('log_update', {"message": "알람 상태가 아닙니다.", "color": "green"})
+                    socketio.emit('alarm_update', {'text': "알람 없음", 'color': 'green'})
+                    socketio.emit('status_update', {"text": "정상 상태", "color": "green"})
+                    socketio.emit('enable_nc_upload', {})
+                    return {"status": "success", "message": "알람 상태가 아닙니다."}
+
+                # 알람 해제 명령 전송
+                controllers.ser.reset_input_buffer()
+                controllers.ser.write(b"$X\n")
+                controllers.ser.flush()
+                time.sleep(0.5)
+
+                # 응답 확인
+                unlock_success = False
+                start_time = time.time()
+                while time.time() - start_time < 1.0:
+                    if controllers.ser.in_waiting > 0:
+                        response = controllers.ser.readline().decode('utf-8', errors='ignore').strip()
+                        if "ok" in response.lower():
+                            unlock_success = True
+                            break
+                    time.sleep(0.05)
 
             if unlock_success:
                 controllers.state = "alarm_unlocked"
+                controllers.notify_state()
                 socketio.emit('log_update', {"message": "알람 해제 성공: 가공 시작 가능", "color": "green"})
                 socketio.emit('alarm_update', {'text': "알람 해제됨", 'color': 'green'})
                 socketio.emit('status_update', {"text": "가공 준비 완료", "color": "green"})
@@ -526,88 +492,93 @@ def init_routes(app, socketio, controllers):
             dz = float(data.get('dz', 0))
             feed = data.get('feed', None)
             
+            # 가공 중에 G91/G90을 끼워 넣으면 진행 중인 프로그램의 좌표 모드가 바뀌므로 금지
+            if controllers.job_active:
+                return {"status": "error", "message": "가공 중에는 Jog 이동을 할 수 없습니다."}
+
             # 그랩 모드 전환 및 이동
             if controllers.ser and controllers.ser.is_open:
-                # 재시도 관련 변수
-                max_retries = 3
-                retry_count = 0
-                command_sent = False
+                with controllers.ser_lock:
+                    # 재시도 관련 변수
+                    max_retries = 3
+                    retry_count = 0
+                    command_sent = False
                 
-                # 버퍼 초기화
-                controllers.ser.reset_input_buffer()
-                controllers.ser.reset_output_buffer()
+                    # 버퍼 초기화
+                    controllers.ser.reset_input_buffer()
+                    controllers.ser.reset_output_buffer()
                 
-                # 상대 좌표계 모드로 전환
-                while not command_sent and retry_count < max_retries:
-                    try:
-                        controllers.ser.write(b"G91\n")
-                        time.sleep(0.3)  # 좀 더 길게 대기
-                        command_sent = True
-                    except Exception:
-                        retry_count += 1
-                        socketio.emit('log_update', {"message": f"Jog 모드 전환 중 시간 초과. 재시도 중... ({retry_count}/{max_retries})"})
-                        time.sleep(1)
-                        if retry_count >= max_retries:
-                            raise Exception("G91 모드 전환 시간 초과")
+                    # 상대 좌표계 모드로 전환
+                    while not command_sent and retry_count < max_retries:
+                        try:
+                            controllers.ser.write(b"G91\n")
+                            time.sleep(0.3)  # 좀 더 길게 대기
+                            command_sent = True
+                        except Exception:
+                            retry_count += 1
+                            socketio.emit('log_update', {"message": f"Jog 모드 전환 중 시간 초과. 재시도 중... ({retry_count}/{max_retries})"})
+                            time.sleep(1)
+                            if retry_count >= max_retries:
+                                raise Exception("G91 모드 전환 시간 초과")
                 
-                # 명령어 재설정 및 재시도 초기화
-                retry_count = 0
-                command_sent = False
+                    # 명령어 재설정 및 재시도 초기화
+                    retry_count = 0
+                    command_sent = False
                 
-                # 이동 명령 전송
-                while not command_sent and retry_count < max_retries:
-                    try:
-                        # 빌드 G-code 명령
-                        cmd = "G1"
-                        if dx:
-                            cmd += f" X{dx}"
-                        if dy:
-                            cmd += f" Y{dy}"
-                        if dz:
-                            cmd += f" Z{dz}"
-                        if feed is not None:
-                            cmd += f" F{feed}"
-                        cmd += "\n"
+                    # 이동 명령 전송
+                    while not command_sent and retry_count < max_retries:
+                        try:
+                            # 빌드 G-code 명령
+                            cmd = "G1"
+                            if dx:
+                                cmd += f" X{dx}"
+                            if dy:
+                                cmd += f" Y{dy}"
+                            if dz:
+                                cmd += f" Z{dz}"
+                            if feed is not None:
+                                cmd += f" F{feed}"
+                            cmd += "\n"
                         
-                        # 명령 전송 및 대기
-                        controllers.ser.write(cmd.encode())
-                        time.sleep(0.5)  # 충분한 처리 시간 부여
-                        command_sent = True
-                    except Exception:
-                        retry_count += 1
-                        socketio.emit('log_update', {"message": f"Jog 이동 명령 전송 중 시간 초과. 재시도 중... ({retry_count}/{max_retries})"})
-                        time.sleep(1)
-                        if retry_count >= max_retries:
-                            raise Exception("이동 명령 전송 시간 초과")
+                            # 명령 전송 및 대기
+                            controllers.ser.write(cmd.encode())
+                            time.sleep(0.5)  # 충분한 처리 시간 부여
+                            command_sent = True
+                        except Exception:
+                            retry_count += 1
+                            socketio.emit('log_update', {"message": f"Jog 이동 명령 전송 중 시간 초과. 재시도 중... ({retry_count}/{max_retries})"})
+                            time.sleep(1)
+                            if retry_count >= max_retries:
+                                raise Exception("이동 명령 전송 시간 초과")
                 
-                # 절대 좌표계 모드로 돌아가기
-                retry_count = 0
-                command_sent = False
-                while not command_sent and retry_count < max_retries:
-                    try:
-                        # 응답을 기다리지 않고 전송만
-                        controllers.ser.write(b"G90\n")
-                        time.sleep(0.3)
-                        command_sent = True
-                    except Exception:
-                        retry_count += 1
-                        socketio.emit('log_update', {"message": f"Jog 모드 복귀 중 시간 초과. 재시도 중... ({retry_count}/{max_retries})"})
-                        time.sleep(1)
-                        if retry_count >= max_retries:
-                            # 이 오류는 무시 가능 (G90으로 복귀 실패해도 다음 명령에서 설정 가능)
-                            socketio.emit('log_update', {"message": "좌표계 모드 복귀 실패. 다음 명령에서 재설정됩니다."})
+                    # 절대 좌표계 모드로 돌아가기
+                    retry_count = 0
+                    command_sent = False
+                    while not command_sent and retry_count < max_retries:
+                        try:
+                            # 응답을 기다리지 않고 전송만
+                            controllers.ser.write(b"G90\n")
+                            time.sleep(0.3)
+                            command_sent = True
+                        except Exception:
+                            retry_count += 1
+                            socketio.emit('log_update', {"message": f"Jog 모드 복귀 중 시간 초과. 재시도 중... ({retry_count}/{max_retries})"})
+                            time.sleep(1)
+                            if retry_count >= max_retries:
+                                # 이 오류는 무시 가능 (G90으로 복귀 실패해도 다음 명령에서 설정 가능)
+                                socketio.emit('log_update', {"message": "좌표계 모드 복귀 실패. 다음 명령에서 재설정됩니다."})
                 
-                # 위치 업데이트
-                new_x = controllers.x_vals[-1] + dx
-                new_y = controllers.y_vals[-1] + dy
-                new_z = controllers.z_vals[-1] + dz
-                controllers.x_vals.append(new_x)
-                controllers.y_vals.append(new_y)
-                controllers.z_vals.append(new_z)
+                    # 위치 업데이트
+                    new_x = controllers.x_vals[-1] + dx
+                    new_y = controllers.y_vals[-1] + dy
+                    new_z = controllers.z_vals[-1] + dz
+                    controllers.x_vals.append(new_x)
+                    controllers.y_vals.append(new_y)
+                    controllers.z_vals.append(new_z)
                 
-                # UI 업데이트
-                controllers.update_ui()
-                return {"status": "success", "message": "Jog 이동 완료"}
+                    # UI 업데이트
+                    controllers.update_ui()
+                    return {"status": "success", "message": "Jog 이동 완료"}
             else:
                 return {"status": "error", "message": "시리얼 포트가 연결되어 있지 않습니다"}
         except Exception as e:
@@ -622,21 +593,26 @@ def init_routes(app, socketio, controllers):
             socketio.emit('status_update', {"text": "컨트롤러 연결 필요", "color": "orange"})
             return {"status": "error", "message": "시리얼 포트가 연결되어 있지 않습니다", "alarm": False}
         
+        # 가공 중에는 스트리밍 스레드만 시리얼을 읽으므로 (버퍼를 비우면 'ok' 응답이 사라짐) 현재 상태만 반환
+        if controllers.job_active:
+            return {"status": "success", "alarm": controllers.state == "alarm", "message": "", "state": controllers.state}
+
         try:
-            # 기존 버퍼 비우기
-            controllers.ser.reset_input_buffer()
-            # 상태 확인 명령 전송
-            controllers.ser.write(b"?\n")
-            controllers.ser.flush()  # 버퍼 즉시 전송
-            # 응답 여러 줄 모두 읽기 (최대 0.8초 대기)
             responses = []
-            start_time = time.time()
-            while time.time() - start_time < 0.8:
-                while controllers.ser.in_waiting > 0:
-                    response = controllers.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if response:
-                        responses.append(response)
-                time.sleep(0.05)
+            with controllers.ser_lock:
+                # 기존 버퍼 비우기
+                controllers.ser.reset_input_buffer()
+                # 상태 확인 명령 전송 (실시간 명령이므로 개행 없이 전송)
+                controllers.ser.write(b"?")
+                controllers.ser.flush()  # 버퍼 즉시 전송
+                # 응답 여러 줄 모두 읽기 (최대 0.8초 대기)
+                start_time = time.time()
+                while time.time() - start_time < 0.8:
+                    while controllers.ser.in_waiting > 0:
+                        response = controllers.ser.readline().decode('utf-8', errors='ignore').strip()
+                        if response:
+                            responses.append(response)
+                    time.sleep(0.05)
             
             # 응답 확인
             alarm_state = False
@@ -702,6 +678,8 @@ def init_routes(app, socketio, controllers):
         try:
             if not hasattr(gcode_module, 'ser') or not gcode_module.ser or not gcode_module.ser.is_open:
                 return jsonify({"status": "error", "message": "시리얼 포트가 연결되어 있지 않습니다."})
+            if gcode_module.job_active:
+                return jsonify({"status": "error", "message": "가공 중에는 원점을 설정할 수 없습니다."})
 
             # 현재 좌표
             x = gcode_module.x_vals[-1] if gcode_module.x_vals else 0
@@ -725,13 +703,15 @@ def init_routes(app, socketio, controllers):
                 gcode_module.y_vals.append(0)
                 gcode_module.z_vals.append(0)
             # GRBL로 전송
-            gcode_module.ser.write(cmd.encode())
-            gcode_module.ser.flush()
+            with gcode_module.ser_lock:
+                gcode_module.ser.write(cmd.encode())
+                gcode_module.ser.flush()
             print(f"[G10] 명령 전송됨: {cmd.strip()}")
+            gcode_module.update_ui()
 
             return jsonify({
                 "status": "success",
-                "message": f"현재 위치를 {axis.upper()} 원점(G10 P0 L20 {axis.upper()}0)으로 설정했습니다."
+                "message": f"현재 위치를 {axis.upper()} 원점(G10 P1 L20 {axis.upper()}0)으로 설정했습니다."
             })
         except Exception as e:
             return jsonify({
@@ -745,10 +725,6 @@ def init_routes(app, socketio, controllers):
         웹소켓 재연결(예: F5 새로고침) 시 서버의 최신 CNC 상태, 경로, 포트, 알람, 로그, 센서 정보를 모두 클라이언트로 전송합니다.
         """
         try:
-            elapsed_time = 0
-            if hasattr(gcode_module, 'process_start_time') and gcode_module.process_start_time:
-                elapsed_time = time.time() - gcode_module.process_start_time
-
             # 포트 상태
             port_status = {
                 'connected': hasattr(gcode_module, 'ser') and gcode_module.ser and hasattr(gcode_module.ser, 'is_open') and gcode_module.ser.is_open,
@@ -778,27 +754,11 @@ def init_routes(app, socketio, controllers):
                 logs = gcode_module.system_logs[-50:]
             # 만약 별도 로그 리스트가 없다면, 로그를 따로 관리해야 함
 
-            # NC 코드 정보
-            nc_code_info = {
-                'lines': len(getattr(gcode_module, 'gcode_lines', [])),
-                'sample': getattr(gcode_module, 'gcode_lines', [])[:10]
-            }
-
-            # CNC 경로 및 상태
-            socketio.emit('position_update', {
-                'x': gcode_module.x_vals[-1] if gcode_module.x_vals else 0,
-                'y': gcode_module.y_vals[-1] if gcode_module.y_vals else 0,
-                'z': gcode_module.z_vals[-1] if gcode_module.z_vals else 0,
-                'path_x': gcode_module.x_vals,
-                'path_y': gcode_module.y_vals,
-                'path_z': gcode_module.z_vals,
-                'spindle': gcode_module.current_spindle,
-                'feedrate': gcode_module.current_feedrate,
-                'progress': gcode_module.progress,
-                'elapsed_time': elapsed_time,
-                'state': gcode_module.state,
-                'nc_code_info': nc_code_info
-            })
+            # CNC 경로 및 상태 (재접속한 클라이언트를 위해 전체 경로 전송)
+            gcode_module.update_ui(full=True)
+            gcode_module.notify_state(force=True)
+            # 허용 공차 (클라이언트 입력창을 서버 값과 일치시킴)
+            socketio.emit('tolerance_update', {'tolerance': gcode_module.tolerance_value})
 
             # 포트 상태
             socketio.emit('connection_status', port_status)
@@ -840,20 +800,25 @@ def init_routes(app, socketio, controllers):
             if not hasattr(gcode_module, 'ser') or not gcode_module.ser or not gcode_module.ser.is_open:
                 socketio.emit('log_update', {"message": "시리얼 포트가 연결되어 있지 않습니다.", "color": "red"})
                 return
-            # 명령 전송
-            gcode_module.ser.write((cmd + '\n').encode())
-            gcode_module.ser.flush()
-            socketio.emit('log_update', {"message": f"> {cmd}", "color": "blue"})
-            # 응답 읽기 (최대 2초 대기)
-            start_time = time.time()
+            # 가공 중 임의 명령을 끼워 넣으면 스트리밍 중인 프로그램과 응답 순서가 섞이므로 금지
+            if gcode_module.job_active:
+                socketio.emit('log_update', {"message": "가공 중에는 GRBL 명령을 직접 보낼 수 없습니다. 일시정지/긴급정지 버튼을 사용하세요.", "color": "red"})
+                return
             responses = []
-            while time.time() - start_time < 2.0:
-                if gcode_module.ser.in_waiting > 0:
-                    resp = gcode_module.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if resp:
-                        responses.append(resp)
-                else:
-                    time.sleep(0.05)
+            with gcode_module.ser_lock:
+                # 명령 전송
+                gcode_module.ser.write((cmd + '\n').encode())
+                gcode_module.ser.flush()
+                socketio.emit('log_update', {"message": f"> {cmd}", "color": "blue"})
+                # 응답 읽기 (최대 2초 대기)
+                start_time = time.time()
+                while time.time() - start_time < 2.0:
+                    if gcode_module.ser.in_waiting > 0:
+                        resp = gcode_module.ser.readline().decode('utf-8', errors='ignore').strip()
+                        if resp:
+                            responses.append(resp)
+                    else:
+                        time.sleep(0.05)
             if responses:
                 for resp in responses:
                     socketio.emit('log_update', {"message": resp, "color": "green" if "ok" in resp.lower() else "red"})
@@ -864,59 +829,36 @@ def init_routes(app, socketio, controllers):
 
     @socketio.on('spindle_override_command')
     def handle_spindle_override_command(data):
-            import time
             ser = getattr(controllers, 'ser', None)
-            cmd = data.get('cmd')
+            cmd = (data or {}).get('cmd')
 
             if not ser or not ser.is_open:
                 socketio.emit('log_update', {"message": "CNC 컨트롤러가 연결되어 있지 않습니다.", "color": "red"})
                 return
 
             try:
-                if cmd == '0x9A':
-                    ser.write(b'\x9A')
-                    socketio.emit('log_update', {"message": "Spindle Override +10% 명령(0x9A) 전송", "color": "green"})
-                elif cmd == '0x9C':
-                    ser.write(b'\x9B')
-                    socketio.emit('log_update', {"message": "Spindle Override -10% 명령(0x9C) 전송", "color": "green"})
-                elif cmd == '0x99':
-                    ser.write(b'\x99')
-                    socketio.emit('log_update', {"message": "Spindle Override Reset 명령(0x99) 전송", "color": "green"})
-                else:
+                if cmd not in SPINDLE_OVERRIDE_COMMANDS:
                     socketio.emit('log_update', {"message": f"알 수 없는 Spindle Override 명령: {cmd}", "color": "orange"})
-                ser.flush()
+                    return
+                command, label = SPINDLE_OVERRIDE_COMMANDS[cmd]
+                with controllers.ser_lock:
+                    ser.write(command)
+                    ser.flush()
+                socketio.emit('log_update', {"message": f"{label} 명령({cmd}) 전송", "color": "green"})
 
-                # GRBL 상태 확인 및 FS 값 파싱
+                # 가공 중에는 스트리밍 스레드가 상태 보고(Ov)로 오버라이드 표시를 갱신하므로 여기서는 읽지 않음
+                if controllers.job_active:
+                    return
+
+                # GRBL 상태 확인 후 실제 스핀들 RPM(FS)과 오버라이드 비율(Ov) 반영
                 time.sleep(0.3)
-                ser.write(b"?\n")
-                ser.flush()
-                time.sleep(0.2)
-
-                if ser.in_waiting > 0:
-                    status = ser.readline().decode().strip()
-                    if "|FS:" in status:
-                        fs_part = status.split("|")
-                        for part in fs_part:
-                            if part.startswith("FS:"):
-                                try:
-                                    _, spindle = part.replace("FS:", "").split(",")
-                                    # spindle 값을 controllers.current_spindle에 반영
-                                    controllers.current_spindle = int(spindle)
-                                    socketio.emit("spindle_rpm_update", {"rpm": spindle})
-                                    # position_update도 emit
-                                    socketio.emit('position_update', {
-                                        'x': controllers.x_vals[-1] if controllers.x_vals else 0,
-                                        'y': controllers.y_vals[-1] if controllers.y_vals else 0,
-                                        'z': controllers.z_vals[-1] if controllers.z_vals else 0,
-                                        'path_x': controllers.x_vals,
-                                        'path_y': controllers.y_vals,
-                                        'path_z': controllers.z_vals,
-                                        'spindle': controllers.current_spindle,
-                                        'feedrate': controllers.current_feedrate,
-                                        'progress': controllers.progress
-                                    })
-                                except:
-                                    pass
+                status = controllers.query_status()
+                if status:
+                    if 'ov' in status:
+                        controllers.feed_override, controllers.spindle_override = status['ov'][0], status['ov'][2]
+                        socketio.emit('override_status', {'spindle': controllers.spindle_override, 'feed': controllers.feed_override})
+                    if 'spindle' in status:
+                        socketio.emit("spindle_rpm_update", {"rpm": int(status['spindle']), "override": controllers.spindle_override})
             except Exception as e:
                 socketio.emit('log_update', {"message": f"Spindle Override 명령 전송 오류: {str(e)}", "color": "red"})
 
@@ -942,8 +884,15 @@ def init_routes(app, socketio, controllers):
         global tolerance_value
         try:
             new_tolerance = float(request.form['tolerance'])
+            # 2차 재가공 깊이 = 원본 Z - 공차 이므로 큰 값은 과절삭/공구 파손으로 이어짐 (NaN도 여기서 거부됨)
+            if not (0.0 <= new_tolerance <= MAX_TOLERANCE_MM):
+                return jsonify({
+                    'status': 'error',
+                    'message': f'허용 공차는 0 ~ {MAX_TOLERANCE_MM}mm 범위로 입력하세요. (입력값: {new_tolerance}mm)'
+                })
             tolerance_value = new_tolerance  # 전역 변수 업데이트
             controllers.tolerance_value = new_tolerance  # controllers 객체 업데이트
+            socketio.emit('tolerance_update', {'tolerance': new_tolerance})
             print("서버에 tolerance_value 갱신:", tolerance_value)
             print("controllers.tolerance_value 갱신:", controllers.tolerance_value)
             print("현재 gcode_lines:", controllers.gcode_lines if controllers.gcode_lines else "비어있음")
@@ -960,10 +909,13 @@ def init_routes(app, socketio, controllers):
             })
     
     def create_rework_file():
-        """rework.nc 파일을 생성하는 내부 함수"""
+        """rework.nc 파일을 생성하는 내부 함수 (수동 요청: 최적화 없이 스핀들 속도만 고정값으로 변경)
+
+        생성된 파일은 자동 가공되지 않습니다 (자동 재가공은 이상 진동 복구 과정에서 만든 파일만 허용).
+        """
         try:
-            import os
-            if not controllers.gcode_lines:
+            source_lines = controllers.rework_source_lines or controllers.gcode_lines
+            if not source_lines:
                 return {'status': 'error', 'message': 'G-code 데이터가 없습니다.'}
 
             # Vibration_detection.csv 파일 존재 여부 확인
@@ -972,12 +924,24 @@ def init_routes(app, socketio, controllers):
                 logging.error(error_msg)
                 return {'status': 'error', 'message': error_msg}
 
-            # rework.nc 파일 생성 - 스핀들 속도를 23000으로 고정
+            # 현재 절삭 조건 (가공 이력이 없으면 NC 코드의 첫 F 값 사용)
+            current_n, current_F = controllers.effective_cutting_conditions()
+            if current_F is None:
+                current_F = next((value for line in source_lines for letter, value in parse_words(line) if letter == 'F' and value > 0), None)
+            if current_F is None:
+                return {'status': 'error', 'message': '이송 속도(F) 정보를 찾을 수 없어 rework.nc를 생성할 수 없습니다.'}
+
+            # rework.nc 파일 생성 - 스핀들 속도를 고정값으로, 이송 속도는 현재 값 유지
             success = create_rework_nc(
-                controllers.gcode_lines,
-                controllers.tolerance_value,
-                controllers.current_feedrate,
-                23000  # 스핀들 속도를 23000으로 고정
+                current_n=current_n or MANUAL_REWORK_SPINDLE,
+                current_F=current_F,
+                optimal_n=MANUAL_REWORK_SPINDLE,
+                optimal_F=current_F,
+                x_pos=controllers.x_vals[-1] if controllers.x_vals else 0.0,
+                y_pos=controllers.y_vals[-1] if controllers.y_vals else 0.0,
+                z_pos=controllers.z_vals[-1] if controllers.z_vals else 0.0,
+                gcode_lines=source_lines,
+                tolerance_value=controllers.tolerance_value
             )
 
             if success:
@@ -1008,18 +972,15 @@ def init_routes(app, socketio, controllers):
     def handle_reset_path(data=None):
         """경로 초기화 이벤트 처리"""
         try:
+            if controllers.job_active:
+                return {'status': 'error', 'message': '가공 중에는 경로를 초기화할 수 없습니다.'}
+
             # 현재 위치 초기화
-            controllers.x_vals[:] = [0]
-            controllers.y_vals[:] = [0]
-            controllers.z_vals[:] = [0]
+            controllers.reset_path()
             controllers.progress = 0
             
             # UI 업데이트
-            socketio.emit('path_update', {
-                'x': controllers.x_vals,
-                'y': controllers.y_vals,
-                'z': controllers.z_vals
-            })
+            controllers.update_ui(full=True)
             socketio.emit('progress_update', {"progress": controllers.progress})
             
             logging.info("경로가 초기화되었습니다.")
@@ -1030,43 +991,14 @@ def init_routes(app, socketio, controllers):
 
     @socketio.on('load_rework_file')
     def handle_load_rework_file(data=None):
-        """rework.nc 파일을 로드하고 가공을 시작합니다."""
+        """rework.nc 파일을 로드하고 가공을 시작합니다.
+
+        state를 미리 "running"으로 바꾸지 않고 start_job()에 맡겨, 재가공에서도
+        진동 탐지·CSV 로깅이 정상 시작 경로로 켜지도록 합니다.
+        """
         try:
-            # rework.nc 파일 읽기
-            try:
-                with open(os.path.join(BASE_DIR, 'nc', 'rework.nc'), 'r') as f:
-                    rework_content = f.read()
-            except Exception as e:
-                error_msg = f"rework.nc 파일을 읽을 수 없습니다: {str(e)}"
-                socketio.emit('log_update', {"message": error_msg, "color": "red"})
-                return {"status": "error", "message": error_msg}
-
-            # NC 코드 로드
-            result = controllers.load_nc_code(rework_content)
-            if result['status'] != 'success':
-                socketio.emit('log_update', {"message": f"rework.nc 로드 실패: {result['message']}", "color": "red"})
-                return result
-
-            # 가공 시작
-            socketio.emit('log_update', {"message": "rework.nc 로드 완료, 가공을 시작합니다.", "color": "green"})
-            
-            # 가공 시작 처리
-            controllers.gcode_current_idx = 0
-            controllers.pause = False
-            controllers.x_vals = [0]
-            controllers.y_vals = [0]
-            controllers.z_vals = [0]
-            controllers.progress = 0
-            controllers.state = "running"
-            
-            # UI 업데이트
-            socketio.emit('status_update', {"text": "가공 시작", "color": "blue"})
-            socketio.emit('disable_nc_upload', {})
-            
-            # 가공 스레드 시작
-            threading.Thread(target=controllers.send_gcode, daemon=True).start()
-            
-            return {"status": "success", "message": "rework.nc 가공이 시작되었습니다."}
+            ok, message = controllers.start_rework_job()
+            return {"status": "success" if ok else "error", "message": message}
             
         except Exception as e:
             error_msg = f"rework.nc 처리 중 오류: {str(e)}"

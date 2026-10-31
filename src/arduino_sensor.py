@@ -23,8 +23,8 @@ print(f"[DEBUG] 실행 경로: {os.path.abspath(__file__)}", file=sys.stderr)
 print(f"[DEBUG] 실행 인자: {sys.argv}", file=sys.stderr)
 
 # 기본 설정값 - 고정 포트 대신 자동 감지로 변경
-DEFAULT_BAUDRATE = 1000000
-DEFAULT_SAMPLE_INTERVAL = 2  # 100ms 간격 (10Hz)
+DEFAULT_BAUDRATE = 115200  # 아두이노 펌웨어(arduino/) 및 서버(cnc_app.py)와 동일
+DEFAULT_SAMPLE_INTERVAL = 0.1  # 100ms 간격 (10Hz, 시뮬레이션 출력용)
 
 class SensorSimulator:
     """실제 센서가 없을 경우 시뮬레이션된 센서 데이터를 생성하는 클래스"""
@@ -116,8 +116,8 @@ def try_connect_port(port, baudrate, timeout=1):
 def main():
     parser = argparse.ArgumentParser(description='Arduino 센서 시뮬레이터 또는 실제 센서 연동')
     parser.add_argument('--port', type=str, help='시리얼 포트 (지정하지 않으면 자동 감지)')
-    parser.add_argument('--baudrate', type=int, default=DEFAULT_BAUDRATE, help='Baud rate (기본값: 9600)')
-    parser.add_argument('--interval', type=float, default=DEFAULT_SAMPLE_INTERVAL, help='샘플링 간격(초) (기본값: 0.1)')
+    parser.add_argument('--baudrate', type=int, default=DEFAULT_BAUDRATE, help=f'Baud rate (기본값: {DEFAULT_BAUDRATE})')
+    parser.add_argument('--interval', type=float, default=DEFAULT_SAMPLE_INTERVAL, help=f'샘플링 간격(초) (기본값: {DEFAULT_SAMPLE_INTERVAL})')
     parser.add_argument('--simulate', action='store_true', help='시뮬레이션 모드 사용 (실제 하드웨어 대신)')
     
     args = parser.parse_args()

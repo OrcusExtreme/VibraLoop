@@ -16,11 +16,11 @@ const float ACCEL_SENSITIVITY = 0.330; // 330mV/g (ADXL335 기준)
 
 // 샘플링 관련 변수
 unsigned long lastSampleTime = 0;
-const unsigned long SAMPLE_INTERVAL = 100; // 100ms마다 샘플링 (10Hz)
+const unsigned long SAMPLE_INTERVAL = 10; // 10ms마다 샘플링 (100Hz, 진동 분석 모델의 학습 데이터 주기와 동일)
 
 void setup() {
-  // 시리얼 통신 초기화 (9600 bps)
-  Serial.begin(9600);
+  // 시리얼 통신 초기화 (115200 bps, 서버 cnc_app.py의 ARDUINO_BAUD_RATE와 동일)
+  Serial.begin(115200);
   
   // 아날로그 레퍼런스 설정 (Arduino Uno/Mega의 경우 기본값은 5V)
   analogReference(DEFAULT);

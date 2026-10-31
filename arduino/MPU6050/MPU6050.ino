@@ -4,7 +4,10 @@
 
 MPU6050 mpu;
 unsigned long lastSampleTime = 0;
-const int sampleInterval = 100; // 100ms 간격으로 데이터 전송 (10Hz)
+// 10ms 간격으로 데이터 전송 (100Hz): data/학습 데이터의 수집 주기(약 100Hz)와 맞춰야
+// 서버의 이상 진동 분석(윈도우 100샘플, 분석 단위 1000샘플)이 학습 때와 같은 시간 축으로 동작합니다.
+// JSON 한 줄(약 100바이트) × 100Hz는 115200bps 대역폭의 약 90%를 사용합니다.
+const int sampleInterval = 10;
 
 void setup() {
   Serial.begin(115200);
