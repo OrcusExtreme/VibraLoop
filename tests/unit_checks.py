@@ -4,9 +4,11 @@ data recorder, experiment NC generator, synthetic runs -> dataset -> train -> ev
 Runs on a throw-away copy of the project made by run_tests.py:
   python tests/run_tests.py unit
 """
+import contextlib
 import csv
 import filecmp
 import glob
+import io
 import json
 import logging
 import os
@@ -190,20 +192,8 @@ check("chatter frequency not used when the sensor cannot resolve tooth passing (
       and optimizer.chatter_frequency_usable(20000, 2, 1400) and not optimizer.chatter_frequency_usable(20000, 2, 1300),
       cf_1k['reason'])
 check("unknown conditions -> no suggestion", opt.suggest(None, 100) is None)
-from sklearn.gaussian_process import GaussianProcessClassifier  # noqa: E402
-from sklearn.preprocessing import StandardScaler  # noqa: E402
-X = np.array([[n, F, ap] for n in range(16000, 24001, 2000) for F in (50, 100, 150) for ap in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)], float)
-limit = np.where(X[:, 0] >= 20000, 0.45, 0.25)
-y = (X[:, 2] > limit).astype(int)
-scaler = StandardScaler().fit(X)
-gpc = GaussianProcessClassifier(random_state=0).fit(scaler.transform(X), y)
-model_path = os.path.join(COPY, "models", "unit_stability.joblib")
-optimizer.save_stability_model(gpc, ['n', 'F', 'ap'], path=model_path, scaler=scaler, p_max=0.2, n_runs=len(X))
-opt_m = optimizer.CuttingConditionOptimizer(model_path=model_path)
-sm = opt_m.suggest(17000, 100, 0.4, purpose='rework')
-check("stability model: picks a safe (n, F, ap) without raising feed", sm['method'] == 'stability_model' and sm['F'] <= 100
-      and sm['p_chatter'] < 0.2, str(sm))
-check("stability model: moves to the stable high-speed region or splits depth", sm['n'] >= 20000 or sm['passes'] >= 2, str(sm))
+check("without a stability limit model: chatter frequency, then the default rule",
+      opt.describe() == {'sld': False, 'methods': ['chatter_frequency', 'fallback']})
 
 print("== rework depth passes ==")
 out = os.path.join(COPY, "nc", "unit_rework.nc")
@@ -318,7 +308,7 @@ check("baseline of the cut established from its first windows", mon.core.baselin
 feed(2.0, scale=3.0)
 check("chatter -> alarm -> online mitigation (no stop yet)", mon.event and mon.event['stage'] == 'mitigating' and not ctl.stops)
 wait_for(lambda: len(ctl.overrides) == 2, 3)
-check("mitigation overrides: spindle 110%, feed 80%", ctl.overrides == [('spindle', 110), ('feed', 80)], str(ctl.overrides))
+check("mitigation overrides: feed 80% first, then spindle 110%", ctl.overrides == [('feed', 80), ('spindle', 110)], str(ctl.overrides))
 check("detection logged as 'mitigate' with evidence", records and records[-1][0][-1] == 'mitigate' and records[-1][0][5] >= 1)
 ctl.snap.update(n_eff=22000.0, F_eff=80.0, spindle_override=110, feed_override=80, spindle_rt=22000.0)
 feed(5.0, scale=3.0)
@@ -418,28 +408,32 @@ check("build_dataset: gated windows, chatter labels only in chatter runs, spectr
                                                                                          if ap > (0.45 if n >= 20000 else 0.3)}
       and win[win['gate'] == 1]['spectral'].astype(str).str.lower().eq('true').all(), (bd.stdout + bd.stderr)[-300:])
 tm0 = subprocess.run([py, os.path.join(COPY, "scripts", "train_models.py"), "--skip-condition"], capture_output=True, text=True, encoding="utf-8")
-check("15 runs + default p_max 5%: warns that no condition is below 5% (GP is conservative)", tm0.returncode == 0 and "⚠️" in tm0.stdout,
-      tm0.stdout[-300:])
-tm = subprocess.run([py, os.path.join(COPY, "scripts", "train_models.py"), "--p-max", "0.25"], capture_output=True, text=True, encoding="utf-8")
-check("train_models: stability and condition models saved with CV report", tm.returncode == 0
-      and os.path.isfile(os.path.join(COPY, "models", "stability_model.joblib"))
-      and os.path.isfile(os.path.join(COPY, "models", "condition_model.joblib")) and "교차 검증" in tm.stdout, (tm.stdout + tm.stderr)[-400:])
+check("no ramp tests in the dataset -> the stability limit model is skipped with a message", tm0.returncode == 0
+      and "ramp_limits.csv" in tm0.stdout and "건너뜁니다" in tm0.stdout, tm0.stdout[-300:])
+tm = subprocess.run([py, os.path.join(COPY, "scripts", "train_models.py")], capture_output=True, text=True, encoding="utf-8")
+check("train_models: detector (P12) and condition models saved with CV reports; the old chatter-probability model is no longer "
+      "made (P11)", tm.returncode == 0 and os.path.isfile(os.path.join(COPY, "models", "condition_model.joblib"))
+      and os.path.isfile(os.path.join(COPY, "models", "detector_model.joblib")) and "[감지 모델] 저장" in tm.stdout
+      and "교차 검증" in tm.stdout and not os.path.exists(os.path.join(COPY, "models", "stability_model.joblib"))
+      and "채터 확률" not in tm.stdout, (tm.stdout + tm.stderr)[-400:])
 print("    " + "\n    ".join(l for l in tm.stdout.splitlines() if l.strip()))
-trained = optimizer.CuttingConditionOptimizer(model_path=os.path.join(COPY, "models", "stability_model.joblib"))
-sug = trained.suggest(16000, 100, 0.5, purpose='rework')
-check("trained optimizer avoids the chatter region (16000 rpm, 0.5 mm)", sug['method'] == 'stability_model'
-      and (sug['n'] >= 19000 or sug['passes'] >= 2), str(sug))
 ev = subprocess.run([py, os.path.join(COPY, "scripts", "evaluate_detector.py")], capture_output=True, text=True, encoding="utf-8")
 check("evaluate_detector: run-level CV detects synthetic chatter", ev.returncode == 0 and "채터 감지율" in ev.stdout, (ev.stdout + ev.stderr)[-300:])
 print("    " + "\n    ".join(l for l in ev.stdout.splitlines() if "감지율" in l or "지연" in l or "오경보" in l))
 ce = subprocess.run([py, os.path.join(COPY, "scripts", "check_env.py")], capture_output=True, text=True, encoding="utf-8")
-check("check_env loads the trained models", "채터 확률 모델(models/stability_model.joblib) 로드·예측 정상" in ce.stdout
-      and "조건 모델(models/condition_model.joblib) 로드·예측 정상" in ce.stdout, ce.stdout[-400:])
+check("check_env loads the trained detector and condition models and says the stability limit model is missing",
+      "조건 모델(models/condition_model.joblib) 로드·예측 정상" in ce.stdout and "안정 한계 모델이 없어" in ce.stdout
+      and "데이터셋 감지 모델(models/detector_model.joblib) 로드·채점 정상" in ce.stdout and "채터 확률" not in ce.stdout,
+      ce.stdout[-400:])
+# 뒤의 감지기 시험(P04–P11)은 학습 데이터 폴더로 학습한 모델을 전제로 하므로, 데이터셋 감지 모델은 P12 시험에서 다시 씀
+detector_unit = os.path.join(COPY, "data", "detector_model_unit.joblib")
+os.replace(os.path.join(COPY, "models", "detector_model.joblib"), detector_unit)
 cm = vm.load_condition_model(os.path.join(COPY, "models", "condition_model.joblib"))
 core_c = vm.DetectionCore(mon.model, dict(vm.DETECTION_DEFAULTS), condition_model=cm)
 feats_loud = dict(features.compute_features(base, tt, cfg)[:0] if False else {}, **{name: 0.3 for name in features.TIME_FEATURE_NAMES}, rms=1.0, spectral=False)
-_, parts, _ = core_c.score(feats_loud, {'n': 20000.0, 'F': 100.0, 'ap': 0.2})
-check("condition model adds a 'condition' part when conditions are known", 'condition' in parts and parts['condition'] > 1, str(parts))
+_, parts, _ = core_c.score(feats_loud, {'n': 20000.0, 'F': 100.0, 'ap': 0.2, 'flutes': 2})
+check("condition model adds a 'condition' part when conditions (incl. flutes) are known", 'condition' in parts and parts['condition'] > 1,
+      str(parts))
 
 print("== evaluation base (P01): synthetic scenarios -> dataset -> evaluation from exact label times ==")
 sys.path.insert(0, os.path.join(COPY, "scripts"))
@@ -488,9 +482,10 @@ syn_json = os.path.join(COPY, "data", "synthetic", "quick.json")
 ev2 = subprocess.run([py, os.path.join(COPY, "scripts", "evaluate_detector.py"), "--dataset", syn_ds, "--json", syn_json],
                      capture_output=True, text=True, encoding="utf-8")
 res = json.load(open(syn_json, encoding="utf-8")) if ev2.returncode == 0 else {}
-check("evaluate_detector: events from label times, summaries per scenario and per alarm path saved as JSON",
+check("evaluate_detector: events from label times, summaries per scenario, alarm path and evidence part saved as JSON",
       ev2.returncode == 0 and res['events_source'] == 'labels' and res['overall']['events'] == len(chatter_runs)
-      and set(res['by_type']) == kinds and 'by_trip' in res and res['by_type']['syn_impulse']['stable_minutes'] > 0
+      and set(res['by_type']) == kinds and 'by_trip' in res and 'by_cause' in res
+      and res['by_type']['syn_impulse']['stable_minutes'] > 0
       and res['dataset'] == 'data/synthetic/dataset', (ev2.stdout + ev2.stderr)[-300:])
 ev3 = subprocess.run([py, os.path.join(COPY, "scripts", "evaluate_detector.py"), "--dataset", syn_ds, "--compare", syn_json],
                      capture_output=True, text=True, encoding="utf-8")
@@ -519,9 +514,10 @@ check("block energy = RMS of the last 50 ms only (window RMS is diluted by the q
 fast_model_stub = {'feature_names': features.TIME_FEATURE_NAMES, 'feature_config': fast_cfg}
 fast_core = vm.DetectionCore(fast_model_stub, dict(vm.DETECTION_DEFAULTS))
 fast_decisions = [fast_core.decide(1.2) for _ in range(16)]
-check("count settings keep their time on the 0.05 s grid: 4/4 -> 16/16 (0.75 s), release 4 -> 16, baseline 8 -> 40 (2 s), CUSUM x5",
-      (fast_core.counts['k'], fast_core.counts['n'], fast_core.counts['release_windows'], fast_core.counts['baseline_windows']) == (16, 16, 16, 40)
-      and abs(fast_core.counts['cusum_threshold'] - 6.0) < 1e-9 and fast_decisions.index('start') == 15, str(fast_core.counts))
+check("time settings in seconds give the same times on the 0.05 s grid: 0.75 s -> 16/16 windows, release 16, baseline 40 (2 s), "
+      "Fast-Trip 3 blocks",
+      (fast_core.counts['k'], fast_core.counts['n'], fast_core.counts['release_windows'], fast_core.counts['baseline_windows'],
+       fast_core.counts['fast_blocks']) == (16, 16, 16, 40, 3) and fast_decisions.index('start') == 15, str(fast_core.counts))
 impulse_core = vm.DetectionCore(fast_model_stub, dict(vm.DETECTION_DEFAULTS))
 check("one impulse (4 overlapping 0.2 s windows above threshold) does not trip on the 0.05 s grid",
       'start' not in [impulse_core.decide(e) for e in [2.0] * 4 + [0.3] * 20])
@@ -561,6 +557,9 @@ def counting_evaluate(acc, t, now):
 
 mon2._evaluate = counting_evaluate
 stream_run = next(r for r in syn_runs if r['run_type'] == 'syn_stable')
+# the fake controller must report the speed/feed the stream was recorded at (the spectrum masks the commanded speed)
+mon2.controllers.snap.update(n_eff=float(stream_run['S_rpm']), n_cmd=float(stream_run['S_rpm']),
+                             F_eff=float(stream_run['F_mm_min']), F_cmd=float(stream_run['F_mm_min']))
 stream_df = pd.read_csv(os.path.join(syn_raw, stream_run['sensor_file']))
 xyz, ts = stream_df[['AccX', 'AccY', 'AccZ']].to_numpy(), stream_df['DeviceTime'].to_numpy()
 first = int(np.searchsorted(ts, 2.0))
@@ -574,8 +573,8 @@ gaps = np.diff([e for e, _ in evaluated])
 per_eval_ms = 1000.0 * spent / max(len(evaluated), 1)
 check("1 kHz stream evaluated every 50 ms with 0.2 s windows; processing per evaluation well under the 50 ms budget",
       len(evaluated) >= 55 and np.allclose(gaps, 0.05, atol=0.0015) and min(n for _, n in evaluated) >= 199
-      and mon2.latest.get('evidence') is not None and per_eval_ms < 20,
-      f"{len(evaluated)} evaluations, {per_eval_ms:.2f} ms each (incl. features, LOF, decision)")
+      and mon2.latest.get('evidence') is not None and mon2.latest['evidence'] < 1.0 and per_eval_ms < 20,
+      f"{len(evaluated)} evaluations, {per_eval_ms:.2f} ms each (incl. features, PCA, decision)")
 mon2.set_sensor_info({'device': 'legacy-json'})  # 헤더 없는 센서: 받은 시각으로 샘플링을 추정
 before_estimate = mon2.profile
 for i in range(first + 3000, first + 4000, 20):
@@ -673,6 +672,521 @@ recording = RecordingCore()
 ed.simulate_run(recording, sim_rows)
 check("offline evaluation mirrors the live gate: feed change inside a cut -> condition_changed before the transient skip",
       recording.calls == ['new_cut', 'step', 'step', 'changed', 'step', 'new_cut'], str(recording.calls))
+
+print("== two-tier decision: Fast-Trip + CUSUM, record-only mode (P06) ==")
+cfg6 = dict(vm.DETECTION_DEFAULTS)
+counts6 = vm.DetectionCore(fast_model_stub, cfg6).counts
+
+
+def feed_rule(rule, evidences, fasts=None):
+    return [rule.update(e, f) for e, f in zip(evidences, fasts or [None] * len(evidences))]
+
+
+rule6 = vm.DecisionRule('two_tier', counts6, cfg6)
+d6 = feed_rule(rule6, [0.5] * 5, [0.2, 1.2, 1.3, 1.4, 1.5])
+check("Fast-Trip: last-50 ms block energy >= 3x baseline in 3 consecutive blocks -> alarm at the 3rd block (0.15 s)",
+      d6.index('start') == 3 and rule6.trip == 'fast', str(d6))
+rule6 = vm.DecisionRule('two_tier', counts6, cfg6)
+check("one or two loud blocks never trip the fast tier",
+      'start' not in feed_rule(rule6, [0.5] * 10, [0.2, 3.0, 0.3, 0.2, 2.0, 2.0, 0.3, 0.2, 0.2, 0.2]))
+rule6 = vm.DecisionRule('two_tier', counts6, cfg6)
+check("CUSUM tier caps evidence at 2: an impulse in 4 overlapping windows (evidence 5) does not trip",
+      'start' not in feed_rule(rule6, [5.0] * 4 + [0.3] * 20))
+rule6 = vm.DecisionRule('two_tier', counts6, cfg6)
+d6 = feed_rule(rule6, [1.5] * 30)
+rule6k = vm.DecisionRule('k_of_n', counts6, cfg6)
+check("CUSUM tier: evidence 1.5 trips after ~0.74 s (15 windows); evidence 2 after ~0.45 s (k_of_n needs 0.75 s either way)",
+      d6.index('start') == 14 and rule6.trip == 'cusum'
+      and feed_rule(vm.DecisionRule('two_tier', counts6, cfg6), [2.0] * 20).index('start') == 8
+      and feed_rule(rule6k, [2.0] * 20).index('start') == 15, str(d6.index('start')))
+rule6 = vm.DecisionRule('two_tier', counts6, cfg6)
+feed_rule(rule6, [0.5] * 3, [1.5] * 3)
+d6 = feed_rule(rule6, [0.5] * 25, [0.9] * 5 + [0.5] * 20)
+check("release needs window AND block evidence below 0.8 for 0.75 s (16 windows)", d6.index('end') == 20, str(d6.index('end')))
+core6 = vm.DetectionCore(fast_model_stub, dict(vm.DETECTION_DEFAULTS))
+core6_legacy = vm.DetectionCore(legacy_stub, dict(vm.DETECTION_DEFAULTS))
+check("default: response stays on k_of_n; fast sensors also run the two-tier rule record-only; legacy sensors have no blocks",
+      core6.rule.mode == 'k_of_n' and core6.shadow is not None and core6.shadow.mode == 'two_tier'
+      and core6_legacy.shadow is None and core6_legacy.counts['fast_blocks'] == 0)
+for mode in ('k_of_n', 'two_tier'):
+    core6 = SelfOnlyCore(fast_model_stub, dict(vm.DETECTION_DEFAULTS, decision_mode=mode))
+    steps6 = [core6.step({'rms': 0.1, 'block_rms': 0.1}) for _ in range(30)]
+    steps6 += [core6.step({'rms': 0.1, 'block_rms': 0.5}) for _ in range(3)]
+    if mode == 'k_of_n':
+        check("record-only: a 5x block burst raises a 'fast' shadow alarm while the k_of_n response stays quiet",
+              steps6[-1]['shadow_decision'] == 'start' and steps6[-1]['shadow_trip'] == 'fast'
+              and not any(s['decision'] for s in steps6), str(steps6[-1]['fast_evidence']))
+    else:
+        check("decision_mode two_tier: the same burst is a real alarm via the fast tier (no shadow rule)",
+              steps6[-1]['decision'] == 'start' and steps6[-1]['trip'] == 'fast' and core6.shadow is None)
+
+# live monitor (1 kHz model from the P04 section): record-only alarm is logged as Action=shadow without any response
+burst_start = first + 6000
+for i in range(first + 4000, burst_start, 20):  # 2 s of normal cutting so the rolling baseline is in place
+    clock2[0] += 0.02
+    mon2.process_sensor_data(xyz[i:i + 20].tolist(), ts[i:i + 20].tolist())
+records_before, overrides_before = len(records), len(mon2.controllers.overrides)
+mean6 = xyz[first:first + 4000].mean(axis=0)
+for i in range(burst_start, burst_start + 300, 20):  # 0.3 s burst: vibration x5
+    clock2[0] += 0.02
+    burst = (xyz[i:i + 20] - mean6) * 5 + mean6
+    mon2.process_sensor_data(burst.tolist(), ts[i:i + 20].tolist())
+new_records = records[records_before:]
+check("live record-only two-tier: 0.3 s x5 burst -> '[기록 전용]' log and a Trip=fast, Action=shadow record; no override, no alarm",
+      any(a[-1] == 'shadow' and k.get('trip') == 'fast' for a, k in new_records)
+      and any(n == 'log_update' and '[기록 전용]' in d.get('message', '') for n, d in mon2.socketio.events)
+      and len(mon2.controllers.overrides) == overrides_before and mon2.event is None,
+      str([(a[-1], k.get('trip')) for a, k in new_records]))
+ok6, _ = mon2.update_settings({'decision_mode': 'two_tier'})
+for i in range(burst_start + 300, burst_start + 2300, 20):
+    clock2[0] += 0.02
+    mon2.process_sensor_data(xyz[i:i + 20].tolist(), ts[i:i + 20].tolist())
+records_before = len(records)
+for i in range(burst_start + 2300, burst_start + 2600, 20):
+    clock2[0] += 0.02
+    burst = (xyz[i:i + 20] - mean6) * 5 + mean6
+    mon2.process_sensor_data(burst.tolist(), ts[i:i + 20].tolist())
+new_records = records[records_before:]
+# (the rework thread clears mon2.event as soon as the fake controllers finish, so check the log and the record instead)
+check("live two_tier: the same burst is a real alarm through the fast tier, logged with Trip=fast",
+      ok6 and any(n == 'log_update' and '판정 빠른 차단' in d.get('message', '') for n, d in mon2.socketio.events)
+      and any(k.get('trip') == 'fast' and a[-1] in ('mitigate', 'stop') for a, k in new_records),
+      str([(a[-1], k.get('trip')) for a, k in new_records]))
+
+print("== PCA-SPE detector (P08) ==")
+from sklearn.decomposition import PCA  # noqa: E402
+
+rng8 = np.random.default_rng(8)
+X8 = rng8.normal(size=(400, 3)) @ rng8.normal(size=(3, 9)) + 0.05 * rng8.normal(size=(400, 9))
+pca8 = vm._fit_pca(X8, 0.99)
+Z8 = (X8 - pca8['mean']) / pca8['scale']
+k8 = pca8['loadings'].shape[1]
+ref8 = PCA(n_components=k8).fit(Z8)
+spe8, t28, contrib8 = vm.pca_scores(pca8, X8)
+check("PCA keeps components up to 99% of the standardized variance (3 hidden factors -> 3); SPE and T² equal scikit-learn's PCA",
+      k8 == 3 and np.allclose(spe8, ((Z8 - ref8.inverse_transform(ref8.transform(Z8))) ** 2).sum(axis=1), atol=1e-9)
+      and np.allclose(t28, (ref8.transform(Z8) ** 2 / ref8.explained_variance_).sum(axis=1)) and np.allclose(contrib8.sum(axis=1), spe8),
+      f"k={k8}, explained {pca8['explained']:.3f}")
+check("at least two residual directions are left for SPE even when asked for 100% of the variance",
+      vm._fit_pca(X8, 1.0)['loadings'].shape[1] == 7)
+x8 = X8[0].copy()
+x8[4] = np.nan
+spe_missing, _, contrib_missing = vm.pca_scores(pca8, x8)
+grid8 = np.repeat(X8[:1], 4001, axis=0)
+grid8[:, 4] = np.linspace(X8[:, 4].min() - 5, X8[:, 4].max() + 5, 4001)
+check("a missing feature (e.g. no non-harmonic ratio) is filled so that SPE uses only the features present (= minimum over its value)",
+      abs(spe_missing[0] - vm.pca_scores(pca8, grid8)[0].min()) < 1e-5 and contrib_missing[0][4] < 1e-12)
+base8 = {name: 0.1 for name in features.TIME_FEATURE_NAMES}
+with_rpm = [dict(base8, spectral_entropy=0.6, nonharmonic_ratio=0.2)] * 100
+without_rpm = [dict(base8, spectral_entropy=0.6, nonharmonic_ratio=None)] * 100
+names8 = features.TIME_FEATURE_NAMES + ['spectral_entropy', 'nonharmonic_ratio']
+vector8 = features.feature_vector(dict(base8, spectral_entropy=0.6), names8)
+check("inputs: 9 vibration features (log), plus spectral entropy / non-harmonic ratio (as is) when >= 95% of the training windows "
+      "have them (uploaded CSVs carry no spindle speed -> no non-harmonic ratio); missing -> NaN",
+      vm.detector_feature_names(with_rpm) == names8 and vm.detector_feature_names(without_rpm) == names8[:-1]
+      and vm.detector_feature_names(with_rpm[:90] + without_rpm[:10]) == names8[:-1]
+      and vm.detector_feature_names([base8] * 50) == features.TIME_FEATURE_NAMES
+      and np.isclose(vector8[0], np.log(0.1)) and vector8[9] == 0.6 and np.isnan(vector8[10]))
+
+
+def pca_window(load, z_share=0.3):
+    """X:Y:Z = 1 : 0.6 : z_share vibration at the given load, steady kurtosis and crest factor, 3 % noise"""
+    noise = rng8.normal(0, 0.03, 9)
+    window = {'rms_x': load * np.exp(noise[0]), 'rms_y': 0.6 * load * np.exp(noise[1]), 'rms_z': z_share * load * np.exp(noise[2])}
+    window.update({f'kurt_{a}': 3.0 * np.exp(noise[3 + i]) for i, a in enumerate('xyz')})
+    window.update({f'crest_{a}': 3.5 * np.exp(noise[6 + i]) for i, a in enumerate('xyz')})
+    window['rms'] = float(np.sqrt((window['rms_x'] ** 2 + window['rms_y'] ** 2 + window['rms_z'] ** 2) / 3))
+    return window
+
+
+sessions8 = [[pca_window(rng8.uniform(0.1, 0.3)) for _ in range(80)] for _ in range(5)]
+model8 = vm.fit_detector(sessions8, None, 'legacy')
+core8 = vm.DetectionCore(model8, dict(vm.DETECTION_DEFAULTS))
+check("thresholds from leave-one-session-out scores (>= 3 sessions); with 2 sessions in-sample x1.2",
+      model8['kind'] == 'pca' and model8['calibration'] == 'session_holdout'
+      and vm.fit_detector(sessions8[:2], None, 'legacy')['calibration'] == 'in_sample')
+_, parts_load, _ = core8.score(pca_window(1.2))
+t2_load = core8.indicators['t2']
+check("4x the heaviest training load with the same X:Y:Z pattern -> T² beyond the training range (shown, not an alarm part), SPE < 1",
+      t2_load > 1 and parts_load['spe'] < 1 and 't2' not in parts_load, f"T²/limit {t2_load:.2f}, spe {parts_load['spe']:.2f}")
+_, parts_break, _ = core8.score(pca_window(0.2, z_share=1.2))
+contrib_break = core8.indicators['contributions']
+check("Z growing alone breaks the learned correlation -> SPE part >= 1, Z vibration named as the largest contribution",
+      parts_break['spe'] > 1 and contrib_break[0][0] == 'rms_z'
+      and vm.describe_cause(parts_break, contrib_break).startswith('spe: rms_z '), f"spe {parts_break['spe']:.1f}, {contrib_break}")
+_, parts_quiet, _ = core8.score(pca_window(0.05))
+ev_t2, parts_t2, _ = vm.DetectionCore(model8, dict(vm.DETECTION_DEFAULTS, t2_alarm=True)).score(pca_window(1.2))
+check("windows quieter than the lowest 10% of training get no SPE/T² (chatter makes vibration larger); t2_alarm adds T² as a part",
+      'spe' not in parts_quiet and core8.indicators == {} and 't2' in parts_t2 and ev_t2 >= parts_t2['t2'] > 1)
+check("cause text for the log and the detection record: largest part, for SPE with its two largest feature contributions",
+      vm.describe_cause({'spe': 1.4, 'level': 0.6}, [('kurt_z', 0.46), ('rms_z', 0.21)]) == 'spe: kurt_z 46%, rms_z 21%'
+      and vm.describe_cause({'level': 1.2, 'spe': 0.4}, [('kurt_z', 0.5)]) == 'level' and vm.describe_cause({}) == '')
+alarm_record = next((k for a, k in records if a[-1] == 'mitigate'), {})
+check("live monitor: alarm log and detection record carry the cause; status events carry T²",
+      alarm_record.get('cause') and any(n == 'log_update' and '주요 원인 ' in d.get('message', '') for n, d in sock.events)
+      and any(n == 'vibration_status' and 't2' in d and 'contributions' in d for n, d in sock.events), str(alarm_record))
+
+print("== override commands: fewer GRBL cycles, feed first, confirmation times (P07) ==")
+
+
+def run_plan(current, plan):
+    """GRBL 1.1: per processing cycle reset first, then +-10 / +-1 once each; the value is clamped at the end of the cycle"""
+    value, path = current, []
+    for batch in plan:
+        if len(set(batch)) != len(batch):
+            return None, path  # the same command twice in one cycle would count once
+        value = 100 if 'reset' in batch else value
+        value += sum(int(step) for step in batch if step != 'reset')
+        path.append(value)
+        value = max(10, min(200, value))
+    return value, path
+
+
+wrong = []
+for current in [None] + list(range(10, 201)):
+    for target in range(10, 201):
+        # an unknown value is modelled as an impossible 1000 %, so only plans that start with a reset can reach the target
+        final, path = run_plan(1000 if current is None else current, cnc_app.override_plan(current, target))
+        if final != target or any(not 10 <= value <= 200 for value in path):
+            wrong.append((current, target))
+check("every change between 10% and 200% (and from an unknown value) reaches the target without leaving the range mid-way",
+      not wrong, str(wrong[:5]))
+check("typical plans: +10 in one cycle, -20 in two, 110->80 via reset in two (not three), 15->10 by -1 steps, 100->117 in three",
+      cnc_app.override_plan(100, 110) == [['+10']] and cnc_app.override_plan(100, 80) == [['-10'], ['-10']]
+      and cnc_app.override_plan(110, 80) == [['reset', '-10'], ['-10']] and cnc_app.override_plan(15, 10) == [['-1']] * 5
+      and len(cnc_app.override_plan(100, 117)) == 3 and cnc_app.override_plan(None, 100) == [['reset']]
+      and cnc_app.override_plan(80, 80) == [])
+
+
+class OverrideControllers(FakeControllers):
+    def apply_overrides(self, targets):
+        self.overrides.append(dict(targets))
+        now = time.time()
+        return {'status': 'success', 'values': dict(targets), 'sent_at': now, 'confirmed_at': now + 0.2, 'commands': 3,
+                'retries': 0}
+
+
+sock7 = FakeSocket()
+mon7 = vm.VibrationMonitor(sock7, OverrideControllers())
+event7 = {'detected_at': time.time() - 0.01}
+mon7._apply_overrides(110, 80, event7)
+check("monitor sends both overrides in one call (feed first) and logs detection -> send -> confirmation times",
+      mon7.controllers.overrides == [{'feed': 80, 'spindle': 110}] and list(mon7.controllers.overrides[0]) == ['feed', 'spindle']
+      and event7['override']['confirmed_at'] - event7['override']['detected_at'] > 0.2 and mon7.get_status()['last_override']
+      and any(n == 'log_update' and '반영 확인' in d['message'] and '감지 후 전송' in d['message'] for n, d in sock7.events))
+
+print("== physical variables and the monotone condition model (P09) ==")
+import joblib  # noqa: E402
+import train_models  # noqa: E402
+
+phys9 = features.cutting_physics(20000, 100, 0.4, 2, 6)
+check("physics: fz = F/(n*Z), A_chip = ap*fz, MRR = ap*ae*F (ap*F without ae); unknown flutes or zero depth -> None",
+      abs(phys9['fz'] - 0.0025) < 1e-12 and abs(phys9['a_chip'] - 0.001) < 1e-12 and abs(phys9['mrr'] - 240.0) < 1e-9
+      and abs(features.cutting_physics(20000, 100, 0.4, 2)['mrr'] - 40.0) < 1e-9
+      and features.cutting_physics(20000, 100, 0.4, None) is None and features.cutting_physics(20000, 100, 0.0, 2) is None)
+rows9 = pd.DataFrame({'run_id': ['a', 'a', 'b', 'c'], 'label': ['stable', 'chatter', 'stable', 'stable'], 'n': 20000.0,
+                      'F': 100.0, 'ap': 0.3, 'flutes': [2, 2, 2, np.nan], 'ae': 6.0, 'rms': 0.1})
+training9 = train_models.condition_rows(rows9)
+check("training rows: stable windows with a known flute count only (chatter and unknown-flute windows are left out)",
+      list(training9['run_id']) == ['a', 'b'] and np.allclose(training9['a_chip'], 0.3 * 100 / (20000 * 2)))
+grid_raw = os.path.join(COPY, "data", "synthetic_grid", "raw")
+grid_ds = os.path.join(COPY, "data", "synthetic_grid", "dataset")
+cond_path = os.path.join(COPY, "models", "condition_grid_unit.joblib")
+g1 = subprocess.run([py, make_syn, "--grid", "--quick", "--out", grid_raw], capture_output=True, text=True, encoding="utf-8")
+g2 = subprocess.run([py, os.path.join(COPY, "scripts", "build_dataset.py"), "--raw", grid_raw, "--out", grid_ds],
+                    capture_output=True, text=True, encoding="utf-8")
+g3 = subprocess.run([py, os.path.join(COPY, "scripts", "train_models.py"), "--dataset", grid_ds, "--skip-detector", "--skip-sld",
+                     "--condition-out", cond_path], capture_output=True, text=True, encoding="utf-8")
+grid_runs = data_recorder.read_manifest(grid_raw)
+cm9 = vm.load_condition_model(cond_path)
+check("synthetic grid test in the recorder format (12 runs, syn_grid) -> dataset -> condition model with a held-out coverage "
+      "report; a coverage short of the 99% target (this sparse quick grid) comes with a warning",
+      g1.returncode == 0 and len(grid_runs) == 12 and {r['run_type'] for r in grid_runs} == {'syn_grid'} and g2.returncode == 0
+      and g3.returncode == 0 and cm9 is not None and "상한 안에 든 비율" in g3.stdout and cm9['log_margin'] > 0
+      and (cm9['coverage'] >= 0.97 or "⚠️" in g3.stdout) and abs(cm9['sensor_fs'] - 1000.0) < 5, (g3.stdout + g3.stderr)[-300:])
+print("    " + "\n    ".join(line for line in g3.stdout.splitlines() if line.startswith('  ')))
+rng9 = np.random.default_rng(9)
+base9 = np.column_stack([rng9.uniform(16000, 24000, 300), rng9.uniform(0.1, 0.4, 300), rng9.uniform(2e-4, 2e-3, 300)])
+monotone9 = True
+for column in (1, 2):  # ap, a_chip
+    for factor in (1.05, 1.5, 3.0):
+        bumped = base9.copy()
+        bumped[:, column] *= factor
+        monotone9 = monotone9 and bool(np.all(cm9['model'].predict(bumped) >= cm9['model'].predict(base9) - 1e-12))
+check("condition model never predicts less vibration for a deeper cut or a larger chip (monotone in ap and A_chip)", monotone9)
+core9 = vm.DetectionCore(mon2.models['fast'], dict(vm.DETECTION_DEFAULTS), condition_model=cm9)
+cond9 = {'n': 20000.0, 'F': 150.0, 'ap': 0.3, 'flutes': 2}
+limit9 = core9.condition_limit(cond9, 1000.0)
+window9 = dict({name: 0.1 for name in features.TIME_FEATURE_NAMES}, rms=0.5 * limit9, fs=1000.0, spectral=False)
+_, parts9, _ = core9.score(window9, cond9)
+_, parts9_no_flutes, _ = core9.score(window9, dict(cond9, flutes=None))
+level_threshold = mon2.models['fast']['rms_threshold']
+check("condition part = RMS / (predicted x held-out 99% margin); with it, the absolute level part is relaxed x1.5",
+      abs(parts9['condition'] - 0.5) < 1e-9 and abs(parts9['level'] - window9['rms'] / level_threshold / 1.5) < 1e-9
+      and 'condition' not in parts9_no_flutes and abs(parts9_no_flutes['level'] - window9['rms'] / level_threshold) < 1e-9,
+      f"limit {limit9:.4f} g, {parts9}")
+check("no condition part outside the trained conditions or for a sensor with another sampling rate; deeper cut -> higher limit",
+      core9.condition_limit(dict(cond9, n=30000.0), 1000.0) is None and core9.condition_limit(cond9, 100.0) is None
+      and core9.condition_limit(dict(cond9, ap=0.2), 1000.0) <= limit9 <= core9.condition_limit(dict(cond9, ap=0.4), 1000.0))
+old_path = os.path.join(COPY, "models", "condition_old_format.joblib")
+joblib.dump({'model': None, 'features': ['n', 'F', 'ap'], 'sigma': 0.3}, old_path)
+check("a condition model saved before P09 (z-score format) is not used (retrain message)", vm.load_condition_model(old_path) is None)
+ev9 = subprocess.run([py, os.path.join(COPY, "scripts", "evaluate_detector.py"), "--dataset", syn_ds, "--condition-model", cond_path,
+                      "--json", os.path.join(COPY, "data", "synthetic", "quick_condition.json")],
+                     capture_output=True, text=True, encoding="utf-8")
+res9 = json.load(open(os.path.join(COPY, "data", "synthetic", "quick_condition.json"), encoding="utf-8")) if ev9.returncode == 0 else {}
+check("evaluate_detector --condition-model: evaluation with the condition model, model summary kept in the JSON",
+      ev9.returncode == 0 and (res9.get('condition_model') or {}).get('n_runs') == 12, (ev9.stdout + ev9.stderr)[-300:])
+
+print("== ramp onset correction, censoring and the stability limit model (P10) ==")
+import build_dataset  # noqa: E402
+
+rng10 = np.random.default_rng(10)
+t10 = np.arange(-4.0, 1.0001, 0.05)
+rise10 = 0.05 + 0.002 * t10 + 0.04 * np.clip(t10 + 1.5, 0.0, 0.7)  # rises from 1.5 s before the label, levels off 0.7 s later
+rows10 = [{'t_host': 100.0 + ti, 'rms': xi + rng10.normal(0, 0.0005), 'nonharmonic_ratio': None} for ti, xi in zip(t10, rise10)]
+onset10, method10 = build_dataset.refine_onset(rows10, 100.0, 0.2)
+flat10 = [dict(r, rms=0.05 + rng10.normal(0, 0.001)) for r in rows10]
+check("onset re-detection: a rise that starts 1.5 s before the label and levels off is found (minus half a window); "
+      "no rise -> the label time is kept",
+      method10.startswith('signal') and abs(onset10 - (100.0 - 1.5 - 0.1)) < 0.06
+      and build_dataset.refine_onset(flat10, 100.0, 0.2) == (100.0, 'label'), f"{onset10 - 100.0:+.2f} s, {method10}")
+ramp_raw = os.path.join(COPY, "data", "synthetic_ramp", "raw")
+ramp_ds = os.path.join(COPY, "data", "synthetic_ramp", "dataset")
+r1 = subprocess.run([py, make_syn, "--ramp", "--quick", "--out", ramp_raw], capture_output=True, text=True, encoding="utf-8")
+r2 = subprocess.run([py, os.path.join(COPY, "scripts", "build_dataset.py"), "--raw", ramp_raw, "--out", ramp_ds],
+                    capture_output=True, text=True, encoding="utf-8")
+limits10 = pd.read_csv(os.path.join(ramp_ds, "ramp_limits.csv"), encoding="utf-8-sig").set_index('run_id') if r2.returncode == 0 \
+    else pd.DataFrame()
+truth10 = pd.read_csv(os.path.join(ramp_raw, "truth.csv"), encoding="utf-8-sig").set_index('run_id') if r1.returncode == 0 \
+    else pd.DataFrame()
+merged10 = limits10.join(truth10[['limit_mm', 'censored']].rename(columns={'censored': 'truth_censored'})) if len(limits10) else limits10
+chatter10 = merged10[merged10['censored'] == 0] if len(merged10) else merged10
+check("synthetic ramp (16000-22000 rpm): runs whose limit (0.6 mm) is beyond the deepest cut (0.55 mm) are censored; for the "
+      "others the corrected onset depth is within 0.01 mm of the true limit, the label depth is 0.04 mm or more too deep",
+      r1.returncode == 0 and r2.returncode == 0 and list(merged10['censored']) == list(merged10['truth_censored'])
+      and set(merged10[merged10['censored'] == 1]['n'].round()) == {16000.0, 20000.0} and len(chatter10) == 2
+      and (chatter10['onset_ap'] - chatter10['limit_mm']).abs().max() < 0.01
+      and (chatter10['label_ap'] - chatter10['limit_mm']).min() > 0.04,
+      merged10[['n', 'limit_mm', 'label_ap', 'onset_ap', 'censored']].to_string() if len(merged10) else (r1.stderr + r2.stderr)[-300:])
+sld_path = os.path.join(COPY, "models", "sld_unit.joblib")
+r3 = subprocess.run([py, os.path.join(COPY, "scripts", "train_models.py"), "--dataset", ramp_ds, "--skip-detector",
+                     "--skip-condition", "--sld-out", sld_path], capture_output=True, text=True, encoding="utf-8")
+sld10 = optimizer.load_sld_model(sld_path)
+check("stability limit model: GPR on the tooth period, censored runs entered at the deepest tested depth, leave-one-speed-out report",
+      r3.returncode == 0 and sld10 is not None and sld10['flutes'] == 2 and sld10['n_censored'] == 2
+      and sld10['speed_range'] == [16000.0, 22000.0] and abs(sld10['max_tested_ap'] - 0.55) < 0.01
+      and "회전수 하나씩 빼고 예측" in r3.stdout, (r3.stdout + r3.stderr)[-400:])
+safe10 = {rpm: optimizer.sld_safe_depth(sld10, rpm) for rpm in (15000, 16000, 18000, 22000, 23000)} if sld10 else {}
+check("safe depth: none outside the tested speeds; ap_safe <= mean <= deepest tested depth; a censored speed stays near the "
+      "tested maximum, a chattering speed near its onset depth",
+      safe10 and safe10[15000] is None and safe10[23000] is None
+      and all(v['ap_safe'] <= v['mu'] <= sld10['max_tested_ap'] + 1e-9 for v in safe10.values() if v)
+      and safe10[16000]['mu'] > 0.45 and safe10[18000]['mu'] < 0.36,
+      str({rpm: v and {k: round(x, 3) if isinstance(x, float) else x for k, x in v.items()} for rpm, v in safe10.items()}))
+strict10 = optimizer.sld_safe_depth(dict(sld10, kappa=50.0), 18000) if sld10 else None
+check("a speed whose safe depth falls below the minimum depth is flagged for a manual check",
+      strict10 is not None and strict10['ap_safe'] == 0.0 and strict10['manual_check'])
+old_ramp = os.path.join(COPY, "data", "old_ramp_dataset")
+os.makedirs(old_ramp, exist_ok=True)
+pd.DataFrame({'run_id': ['a', 'b'], 'n': [18000, 20000], 'F': [100, 100], 'onset_ap': [0.31, None], 'max_ap': [0.6, 0.6],
+              'note': ['', '채터 없음 (최대 깊이까지 안정)']}).to_csv(os.path.join(old_ramp, 'ramp_limits.csv'), index=False,
+                                                              encoding='utf-8-sig')
+old_rows10 = train_models.sld_rows(old_ramp)
+check("ramp_limits.csv written before P10 (no censored column): an empty onset counts as censored at the deepest tested depth",
+      list(old_rows10['censored']) == [0, 1] and list(old_rows10['target']) == [0.31, 0.6], old_rows10.to_string())
+
+print("== optimizer with the stability limit model (P11) ==")
+sld11_ds = os.path.join(COPY, "data", "sld_unit_dataset")
+os.makedirs(sld11_ds, exist_ok=True)
+speeds11 = list(range(16000, 24001, 500))  # trough at 19000-20500 rpm, stable lobe from 22500 rpm
+limits11 = [0.30, 0.30, 0.28, 0.24, 0.18, 0.14, 0.12, 0.12, 0.12, 0.12, 0.14, 0.20, 0.30, 0.40, 0.48, 0.50, 0.50]
+pd.DataFrame({'run_id': [f"R{s}" for s in speeds11], 'n': speeds11, 'F': 100.0, 'onset_ap': limits11, 'max_ap': 0.55,
+              'censored': 0, 'flutes': 2, 'tool_id': 'T1'}).to_csv(os.path.join(sld11_ds, 'ramp_limits.csv'), index=False,
+                                                                     encoding='utf-8-sig')
+sld11_path = os.path.join(COPY, "models", "sld_p11_unit.joblib")
+with contextlib.redirect_stdout(io.StringIO()):
+    train_models.train_sld(sld11_ds, sld11_path)
+opt11 = optimizer.CuttingConditionOptimizer(model_path=sld11_path)
+safe11 = {s: optimizer.sld_safe_depth(opt11.sld, s)['ap_safe'] for s in range(16000, 24001, 250)} if opt11.sld else {}
+
+
+def rework_time11(speed, n, ap, min_passes):
+    """rework time in units of one pass at the current feed (passes / feed ratio); None if more than 5 passes are needed"""
+    needed = int(np.ceil(ap / safe11[speed] - 1e-9))
+    return max(needed, min_passes) / min(1.0, speed / n) if needed <= 5 else None
+
+
+def fastest11(times, n, chosen):
+    """the chosen speed has the shortest time, and no speed with the same time is closer to the current speed"""
+    best = min(t for t in times.values() if t is not None)
+    return abs(times[chosen] - best) < 1e-9 and all(abs(s - n) >= abs(chosen - n) for s, t in times.items()
+                                                    if t is not None and abs(t - best) < 1e-9)
+
+
+describe11 = opt11.describe()
+check("model window info: stability limit model with its ramp count, speed range and tool",
+      describe11['sld'] and describe11['methods'][0] == 'sld' and describe11['runs'] == 17
+      and describe11['speed_range'] == [16000.0, 24000.0] and describe11['flutes'] == 2 and describe11['tool_id'] == 'T1',
+      str(describe11))
+rw11 = opt11.suggest(20000, 100, 0.3, flutes=2, tool_id='T1', purpose='rework')
+times11 = {s: rework_time11(s, 20000, 0.3, 1) for s in safe11}
+check("rework at the trough (20000 rpm, 0.3 mm): the speed with the shortest rework time (passes / feed), here one pass on "
+      "the stable lobe; feed unchanged", rw11['method'] == 'sld' and rw11['passes'] == 1 and rw11['n'] >= 22000
+      and rw11['F'] == 100.0 and rw11['ap_safe'] >= 0.3 and fastest11(times11, 20000, rw11['n']), str(rw11))
+rw11_min2 = opt11.suggest(20000, 100, 0.3, flutes=2, tool_id='T1', purpose='rework', min_passes=2)
+times11_min2 = {s: rework_time11(s, 20000, 0.3, 2) for s in safe11}
+check("with the monitor's 2-pass minimum the comparison changes: the nearest speed where 2 passes are safe",
+      rw11_min2['method'] == 'sld' and rw11_min2['passes'] == 2 and 20000 < rw11_min2['n'] < rw11['n']
+      and fastest11(times11_min2, 20000, rw11_min2['n']), str(rw11_min2))
+on11 = opt11.suggest(20000, 100, 0.3, flutes=2, tool_id='T1', purpose='online')
+closer11 = [s for s, v in safe11.items() if v >= 0.3 and 250 <= abs(s - 20000) < abs(on11['n'] - 20000)]
+check("online: the nearest speed whose safe depth covers the current depth (never the chattering speed), feed unchanged",
+      on11['method'] == 'sld' and on11['passes'] == 1 and on11['F'] == 100.0 and safe11[on11['n']] >= 0.3
+      and abs(on11['n'] - 20000) >= 250 and not closer11, str(on11))
+on11_low = opt11.suggest(19000, 100, 0.2, flutes=2, tool_id='T1', purpose='online')
+check("a lower speed lowers the feed by the same ratio, so the feed per tooth does not grow",
+      on11_low['method'] == 'sld' and on11_low['n'] < 19000 and abs(on11_low['F'] - 100 * on11_low['n'] / 19000) < 0.1
+      and on11_low['F'] / on11_low['n'] <= 100 / 19000 and "날당 이송" in on11_low['reason'], str(on11_low))
+other11 = [opt11.suggest(20000, 100, 0.3, flutes=3, tool_id='T1'), opt11.suggest(20000, 100, 0.3, flutes=2, tool_id='T9')]
+check("another tool (flute count or tool number differs) -> the model is not used and the reason says so; "
+      "an unknown tool number with the same flute count still uses it",
+      all(r['method'] == 'fallback' and "다른 공구(T1, 2날)" in r['reason'] for r in other11)
+      and opt11.suggest(20000, 100, 0.3, flutes=2)['method'] == 'sld', other11[0]['reason'])
+unknown11 = [opt11.suggest(20000, 100, 0.3), opt11.suggest(20000, 100, None, flutes=2, purpose='online')]
+check("unknown flute count or depth -> default rule, with the reason",
+      all(r['method'] == 'fallback' for r in unknown11) and "날 수를 몰라" in unknown11[0]['reason']
+      and "깊이를 몰라" in unknown11[1]['reason'], f"{unknown11[0]['reason']} / {unknown11[1]['reason']}")
+deep11 = opt11.suggest(20000, 100, 3.0, flutes=2, purpose='rework')
+deep11_online = opt11.suggest(20000, 100, 0.6, chatter_freq=1500, flutes=2, purpose='online', sample_rate=4000)
+check("no speed can take the depth (rework: more than 5 passes; online: deeper than every safe depth) -> the next method, "
+      "with the reason", deep11['method'] == 'fallback' and "5번 안에" in deep11['reason']
+      and deep11_online['method'] == 'chatter_frequency' and "안전한 다른 회전수가 없음" in deep11_online['reason'],
+      f"{deep11['reason']} / {deep11_online['reason']}")
+check("the pass minimum applies to every method (default-rule rework with a 3-pass minimum -> 3 passes)",
+      opt.suggest(20000, 100, 0.3, purpose='rework', min_passes=3)['passes'] == 3)
+grows11 = []
+for n11 in range(16000, 24001, 500):
+    for ap11 in (0.1, 0.2, 0.3, 0.45, 0.6):
+        for purpose11 in ('online', 'rework'):
+            r = opt11.suggest(n11, 100, ap11, flutes=2, purpose=purpose11, min_passes=2)
+            if r['F'] > 100 or r['F'] / r['n'] > 100 / n11:
+                grows11.append((n11, ap11, purpose11, r['n'], r['F']))
+check("feed and feed per tooth never grow (every speed x depth x purpose, 170 cases)", not grows11, str(grows11[:3]))
+old_gpc11 = os.path.join(COPY, "models", "stability_model.joblib")
+joblib.dump({'model': None, 'features': ['n', 'F', 'ap'], 'p_max': 0.05}, old_gpc11)
+ce11 = subprocess.run([py, os.path.join(COPY, "scripts", "check_env.py")], capture_output=True, text=True, encoding="utf-8")
+check("an old chatter-probability model file is never read as a stability limit model; check_env says it can be deleted",
+      optimizer.CuttingConditionOptimizer(model_path=old_gpc11).sld is None and "예전 채터 확률 모델" in ce11.stdout,
+      ce11.stdout[-300:])
+
+print("== dataset detector model, settings validation, model window (P12) ==")
+t12 = 1000.0 + np.arange(1, 81) * 0.25  # 1 s windows every 0.25 s, ends 1000.25 .. 1020.0
+w12 = pd.DataFrame({'run_id': 'r1', 't_host': t12, 'gate': 1, 'transient': 0, 'label': 'stable', 'profile': 'legacy'})
+w12.loc[(w12['t_host'] > 1010.5) & (w12['t_host'] <= 1014.5), 'label'] = 'chatter'
+w12 = pd.concat([w12, w12.assign(run_id='r2', label='stable')], ignore_index=True)
+kept12 = train_models.normal_windows(w12, {'r1': [1010.0]})
+stable12 = set(w12[(w12['run_id'] == 'r1') & (w12['label'] == 'stable')]['t_host'])
+dropped12 = stable12 - set(kept12[kept12['run_id'] == 'r1']['t_host'])
+fallback12 = train_models.normal_windows(w12, train_models.label_starts(os.path.join(COPY, "data", "no_labels_here"), w12))
+dropped_fb12 = stable12 - set(fallback12[fallback12['run_id'] == 'r1']['t_host'])
+check("normal windows: stable windows overlapping the 3 s before a chatter label (late label) or its start are left out; after the "
+      "label and other runs are kept; without labels.csv the start of the first chatter window is used (a window earlier)",
+      sorted(dropped12) == [t for t in t12 if 1007.0 < t < 1011.0 and not 1010.5 < t <= 1014.5]
+      and (kept12['run_id'] == 'r2').sum() == 80 and kept12[kept12['run_id'] == 'r1']['t_host'].max() == 1020.0
+      and sorted(dropped_fb12 - dropped12) == [1007.0] and max(dropped_fb12) < 1011.0,
+      f"dropped {sorted(dropped12)}, without labels.csv {sorted(dropped_fb12)}")
+check("evaluate_detector trains on the same normal windows (guard recorded in the JSON)",
+      res.get('label_guard_sec') == 3.0 and res.get('guarded_windows', 0) > 0, str({k: res.get(k) for k in ('label_guard_sec', 'guarded_windows')}))
+os.replace(detector_unit, os.path.join(COPY, "models", "detector_model.joblib"))
+bundle12 = vm.load_detector_models()
+check("dataset detector model: one PCA-SPE model per window setting, with the non-harmonic ratio (the dataset has the spindle speed)",
+      bundle12 is not None and set(bundle12['models']) == {'fast'} and bundle12['dataset'] == 'data/dataset'
+      and 'nonharmonic_ratio' in bundle12['models']['fast']['feature_names'] and bundle12['label_guard_sec'] == 3.0,
+      str(bundle12 and {p: m['feature_names'] for p, m in bundle12['models'].items()}))
+stale12 = os.path.join(COPY, "data", "detector_stale.joblib")
+joblib.dump(dict(bundle12, feature_version=bundle12['feature_version'] - 1), stale12)
+joblib.dump({'kind': 'lof', 'models': bundle12['models']}, stale12 + ".kind")
+check("a detector model from another feature version or format is not used",
+      vm.load_detector_models(stale12) is None and vm.load_detector_models(stale12 + ".kind") is None)
+mon12 = vm.VibrationMonitor(FakeSocket(), FakeControllers())
+mon12.set_sensor_info({'device': 'MPU6050', 'fs': 1000.0, 'range_g': 8})
+st12 = mon12.get_status()
+check("server: the dataset model serves its window setting (no fallback), the folder CSVs train the other one; status says which",
+      st12['window']['profile'] == 'fast' and not st12['window']['fallback'] and st12['profiles']['fast']['source'] == 'dataset'
+      and st12['profiles']['fast']['nonharmonic'] and st12['profiles']['legacy']['source'] == 'folder'
+      and st12['detector_model']['profiles'] == ['fast'] and st12['t2_recent'] is None and json.dumps(st12) is not None,
+      str({p: (v['source'], v['features']) for p, v in st12['profiles'].items()}))
+mon12.is_running = True
+clock12 = [9000.0]
+mon12.clock = lambda: clock12[0]
+mon12._on_alarm = lambda *a, **k: None  # 이 시험은 학습 범위 밖 비율만 봄 (대응은 앞의 시험에서 확인)
+mon12._on_shadow_alarm = lambda *a, **k: None
+s07 = pd.read_csv(os.path.join(raw_dir, "S07_sensor.csv"))  # 데이터셋의 안정 실행 (20000 rpm, 0.35 mm)
+xyz07, ts07 = s07[['AccX', 'AccY', 'AccZ']].to_numpy(), s07['DeviceTime'].to_numpy()
+mon12.controllers.snap.update(n_eff=20000.0, n_cmd=20000.0, F_eff=100.0, F_cmd=100.0, z=-0.35)
+start07 = int(np.searchsorted(ts07, 2.0))
+for i in range(start07, start07 + 3000, 20):
+    clock12[0] += 0.02
+    mon12.process_sensor_data(xyz07[i:i + 20].tolist(), ts07[i:i + 20].tolist())
+recent12 = mon12.get_status()['t2_recent']
+check("model window: share of recent judged windows outside the training range (T² >= threshold), counted per model; "
+      "a cut like the training runs stays inside",
+      recent12 is not None and recent12['windows'] >= 20 and recent12['fraction'] <= 0.2
+      and abs(recent12['seconds'] - recent12['windows'] * 0.05) < 1e-9 and mon12._t2_recent.maxlen == 1200, str(recent12))
+os.replace(os.path.join(COPY, "models", "detector_model.joblib"), detector_unit)
+ok12r, msg12r = mon12.reset_analyzer()
+st12r = mon12.get_status()
+os.replace(detector_unit, os.path.join(COPY, "models", "detector_model.joblib"))
+ok12s, msg12s = mon12.reset_analyzer()
+check("'reset' re-reads models/: without the dataset model the 1 kHz sensor falls back to the 1 s folder model; with it, the "
+      "dataset model is used again and the message says so",
+      ok12r and st12r['detector_model'] is None and st12r['window']['fallback'] and ok12s
+      and mon12.get_status()['profiles']['fast']['source'] == 'dataset' and "데이터셋 감지 모델" in msg12s, f"{msg12r} / {msg12s}")
+with open(os.path.join(syn_raw, stream_run['sensor_file']), "rb") as f:
+    ok12u, msg12u = mon12.add_training_file("fast_p12.csv", f.read())
+check("uploading a 1 kHz CSV retrains the folder models, and the message says the dataset model still serves that window setting",
+      ok12u and "models/detector_model.joblib" in msg12u and mon12.get_status()['profiles']['fast']['source'] == 'dataset', msg12u)
+os.remove(os.path.join(COPY, "data", "학습 데이터", "fast_p12.csv"))
+
+check("settings validation: every default passes; wrong types, out-of-range and unknown values are named",
+      all(vm.setting_problem(k, v) is None for k, v in vm.DETECTION_DEFAULTS.items())
+      and all(vm.setting_problem(k, v) for k, v in (('cusum_cap', 1.0), ('rework_min_passes', 6), ('rework_min_passes', 2.0),
+                                                     ('spe_quantile', 1.5), ('mitigation_enabled', 'false'), ('bogus', 1),
+                                                     ('confirm_sec', float('nan')), ('decision_mode', 'bogus'))))
+with open(vm.SETTINGS_PATH, "w", encoding="utf-8") as f:
+    json.dump({'decision_mode': 'bogus', 'mitigation_enabled': 'false', 't2_alarm': True, 'confirm_sec': 0.5}, f)
+loaded12, problems12 = vm.load_settings()
+ce12 = subprocess.run([py, os.path.join(COPY, "scripts", "check_env.py")], capture_output=True, text=True, encoding="utf-8")
+check("a hand-edited detector_settings.json: only valid screen settings are used, the rest is listed; check_env flags it",
+      loaded12 == {'t2_alarm': True} and len(problems12) == 3 and any('confirm_sec' in p for p in problems12)
+      and "detector_settings.json에 쓰지 않는 값" in ce12.stdout and "decision_mode='bogus'" in ce12.stdout, str(problems12))
+mon12b = vm.VibrationMonitor(FakeSocket(), FakeControllers())
+notes12b = mon12b.get_status()['notes']
+ok12b, _ = mon12b.update_settings({'decision_mode': 'two_tier'})
+notes12c = mon12b.get_status()['notes']
+check("the monitor starts with defaults for bad saved values and lists them; two-tier on a 1 s model is noted (no Fast-Trip); "
+      "saving rewrites the file with checked values only",
+      mon12b.config['decision_mode'] == 'two_tier' and any('decision_mode' in n for n in notes12b) and ok12b
+      and any('빠른 차단 없이' in n for n in notes12c) and not any('bogus' in n for n in notes12c)
+      and json.load(open(vm.SETTINGS_PATH, encoding="utf-8")).get('decision_mode') == 'two_tier', str(notes12c))
+check("screen settings must be true/false or a known mode (no truthy strings)",
+      not mon12b.update_settings({'mitigation_enabled': 'false'})[0] and not mon12b.update_settings({'confirm_sec': 0.5})[0])
+mon12b.update_settings({'decision_mode': 'k_of_n'})
+ev12 = subprocess.run([py, os.path.join(COPY, "scripts", "evaluate_detector.py"), "--dataset", syn_ds, "--set", "cusum_cap=0.5"],
+                      capture_output=True, text=True, encoding="utf-8")
+check("evaluate_detector --set: a value outside the allowed range is refused before evaluating",
+      ev12.returncode != 0 and "cusum_cap=0.5" in (ev12.stdout + ev12.stderr), (ev12.stdout + ev12.stderr)[-200:])
+old_cond12 = os.path.join(COPY, "models", "condition_p12.joblib")
+joblib.dump({'model': None, 'features': ['n', 'F', 'ap'], 'sigma': 0.3}, old_cond12)
+tm12 = subprocess.run([py, os.path.join(COPY, "scripts", "train_models.py"), "--skip-detector", "--skip-sld",
+                       "--condition-out", old_cond12], capture_output=True, text=True, encoding="utf-8")
+check("train_models moves unused old models to models/legacy/ instead of deleting or overwriting them "
+      "(chatter-probability model, old-format condition model at the output path)",
+      tm12.returncode == 0 and not os.path.exists(old_gpc11) and "[예전 모델]" in tm12.stdout
+      and os.path.isfile(os.path.join(COPY, "models", "legacy", "stability_model.joblib"))
+      and os.path.isfile(os.path.join(COPY, "models", "legacy", "condition_p12.joblib"))
+      and vm.load_condition_model(old_cond12) is not None, (tm12.stdout + tm12.stderr)[-300:])
 
 print(f"\nunit checks: {sum(results)}/{len(results)} passed", flush=True)
 os._exit(0 if all(results) else 1)

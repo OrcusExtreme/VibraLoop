@@ -7,13 +7,17 @@
                   아니면 1초·0.25초('legacy'). 특징은 실시간 감지와 같은 src/features.py로 계산합니다.
   runs.csv        실행마다 대표 조건(판정 구간의 중앙값)과 채터 윈도우 비율
   labels.csv      라벨 구간 원본 (실행, 라벨, 시작·끝 서버 시각) → evaluate_detector.py가 감지 지연을 구간 시작부터 잼
-  ramp_limits.csv 경사 절입 시험(run_type=ramp)에서 채터가 처음 나타난 깊이 = 회전수별 안정 한계 추정값
-                  → scripts/make_experiment_nc.py grid --limits 에 넣어 본 실험 깊이를 정합니다.
+  ramp_limits.csv 경사 절입 시험(run_type=ramp)에서 채터가 시작된 깊이 = 회전수별 안정 한계 추정값 (edit_analysis2.md P10)
+                  onset_ap: 라벨 앞 3초 안에서 신호로 다시 찾은 시작 깊이 (작업자 반응 지연 보정, refine_onset)
+                  label_ap: 라벨 시각의 깊이, censored=1: 끝까지 채터가 없던 실행 (한계 ≥ max_ap, 중도절단)
+                  → scripts/train_models.py가 안정 한계 모델(SLD)을 학습하고, 회전수별 최솟값은
+                    scripts/make_experiment_nc.py grid --limits 에 넣어 본 실험 깊이를 정합니다.
 판정 구간: 가공 중(State=running), GRBL Run, Z ≤ -gate_depth, 스핀들 회전 (실시간 감지와 같은 규칙).
 라벨: 윈도우가 라벨 구간과 overlap 이상 겹치면 그 라벨 (채터 > 전이 > 비가공), 아니면 판정 구간이면 stable.
 """
 import argparse
 import csv
+import math
 import os
 import sys
 
@@ -28,6 +32,7 @@ from data_recorder import read_manifest  # noqa: E402
 from vibration_monitor import DETECTION_DEFAULTS  # noqa: E402
 
 LABEL_PRIORITY = ['chatter', 'transition', 'air']
+ONSET_SEARCH_SEC = 3.0  # ramp: 라벨 앞 이 시간 안에서 채터가 시작된 점을 신호로 다시 찾음 (작업자 반응 지연 보정)
 LABEL_COLUMNS = ['run_id', 'run_type', 'label', 'start', 'end', 'start_x', 'end_x', 'note']
 FEATURE_COLUMNS = (features.TIME_FEATURE_NAMES
                    + ['rms', 'saturation', 'fs', 'spectral', 'nonharmonic_ratio', 'peak_freq', 'peak_prominence',
@@ -100,6 +105,78 @@ def window_label(labels, start, end, overlap):
     return None
 
 
+def onset_statistics(rows):
+    """채터가 시작되면 커지는 윈도우 통계: 진동 크기(rms)와, 주파수 특징이 있으면 비고조파 진동 크기(rms·√비고조파 비율)"""
+    stats = {'rms': np.array([r['rms'] for r in rows], dtype=float)}
+    if all(r.get('nonharmonic_ratio') is not None and np.isfinite(r['nonharmonic_ratio']) for r in rows):
+        stats['nonharmonic_rms'] = np.array([r['rms'] * math.sqrt(max(r['nonharmonic_ratio'], 0.0)) for r in rows])
+    return stats
+
+
+def knee_fit(t, x, search_sec=ONSET_SEARCH_SEC):
+    """'직선 위에 꺾이는 점부터 더해지는 상승, 채터가 다 커지면 다시 평평'을 최소제곱으로 맞춥니다.
+    꺾이는 점 후보는 t가 -search_sec..0인 윈도우, 다 커지는 점 후보는 그 뒤의 윈도우(끝까지 커지면 마지막)입니다.
+    다 커지는 점이 없으면 깊이가 빨리 늘 때(짧은 ramp) 상승 뒤의 평평한 구간 때문에 꺾이는 점이 앞당겨집니다.
+    반환: (꺾이는 점, 꺾임 없는 직선보다 줄어든 오차 비율). 상승이 양수인 후보가 없으면 (None, 0)."""
+    line = np.column_stack([np.ones_like(t), t])
+    line_sse = float(np.sum((x - line @ np.linalg.lstsq(line, x, rcond=None)[0]) ** 2))
+    best = None
+    for knee in t[(t >= -search_sec) & (t <= 0.0)]:
+        for top in t[t > knee]:
+            design = np.column_stack([np.ones_like(t), t, np.clip(t - knee, 0.0, top - knee)])
+            coef = np.linalg.lstsq(design, x, rcond=None)[0]
+            sse = float(np.sum((x - design @ coef) ** 2))
+            if coef[2] > 0 and (best is None or sse < best[0]):
+                best = (sse, knee)
+    if best is None or line_sse <= 0:
+        return None, 0.0
+    return float(best[1]), 1.0 - best[0] / line_sse
+
+
+def refine_onset(rows, label_start, window_sec):
+    """ramp 실행에서 채터가 시작된 시각을 신호로 다시 찾습니다 (edit_analysis2.md P10, 분석 2.5).
+
+    작업자는 채터를 듣고 늦게 라벨을 누르므로 라벨 시각의 깊이는 실제 한계보다 깊습니다(1–2초면 0.04–0.08 mm).
+    라벨 앞 ONSET_SEARCH_SEC 안에서 통계(onset_statistics)마다 꺾이는 점을 찾고(knee_fit), 오차가 더 많이 준 통계의 점을
+    씁니다. 깊이가 늘며 진동이 조금씩 커지는 것은 바탕 직선이 흡수합니다. 강한 채터가 회전 고조파 위치 근처에
+    생기면 비고조파 비율이 오히려 떨어질 수 있어, 진동 크기(rms)도 함께 봅니다.
+    오차가 30% 넘게 줄지 않으면 라벨 시각을 그대로 씁니다. 꺾이는 점은 윈도우 끝 시각이라 윈도우 길이의 절반을 뺍니다.
+    rows: 판정 구간 윈도우(시간 순서), 반환: (시작 시각, 'signal (통계 이름)' 또는 'label')
+    """
+    span = [r for r in rows if label_start - ONSET_SEARCH_SEC - 1.0 <= r['t_host'] <= label_start + 1.0]
+    if len(span) < 8:
+        return label_start, 'label'
+    t = np.array([r['t_host'] for r in span]) - label_start
+    fits = {name: knee_fit(t, x) for name, x in onset_statistics(span).items()}
+    name, (knee, reduction) = max(fits.items(), key=lambda item: item[1][1])
+    if knee is None or reduction < 0.3:
+        return label_start, 'label'
+    return label_start + knee - window_sec / 2, f'signal ({name})'
+
+
+def ramp_limit(run, cut):
+    """ramp 실행 하나의 안정 한계 행 (ramp_limits.csv). 채터·전이 라벨이 없으면 중도절단(censored)."""
+    t_cut = np.array([r['t_host'] for r in cut])
+    ap_cut = np.array([r['ap'] for r in cut], dtype=float)
+    labels = sorted((seg for seg in run['labels'] if seg.get('label') in ('chatter', 'transition') and seg.get('start') is not None),
+                    key=lambda seg: seg['start'])
+    row = {'run_id': run['run_id'], 'n': float(np.nanmedian([r['n'] for r in cut])),
+           'F': float(np.nanmedian([r['F'] for r in cut])), 'flutes': run.get('flutes'), 'tool_id': run.get('tool_id'),
+           'onset_ap': '', 'label_ap': '', 'onset_method': '', 'onset_shift_s': '', 'censored': 0,
+           'max_ap': round(float(np.nanmax(ap_cut)), 3), 'note': ''}
+    if not labels:
+        row.update(censored=1, note='채터 없음 (최대 깊이까지 안정, 중도절단)')
+        return row
+    window_sec = features.WINDOW_PROFILES[cut[0]['profile']]['window_sec']
+    start = labels[0]['start']
+    onset, method = refine_onset(cut, start, window_sec)
+    row.update(onset_ap=round(float(np.interp(onset, t_cut, ap_cut)), 3), label_ap=round(float(np.interp(start, t_cut, ap_cut)), 3),
+               onset_method=method, onset_shift_s=round(start - onset, 2))
+    if method == 'label':
+        row['note'] = '신호에서 시작점을 찾지 못해 라벨 시각 사용'
+    return row
+
+
 def build_run(raw_dir, run, config, overlap):
     segments, timing = load_sensor(os.path.join(raw_dir, run['sensor_file']))
     machine = pd.read_csv(os.path.join(raw_dir, run['machine_file']))
@@ -169,11 +246,7 @@ def main():
                    'ae': run.get('ae_mm'), 'flutes': run.get('flutes')}
         run_rows.append(summary)
         if run.get('run_type') == 'ramp' and cut:
-            onset = next((r for r in cut if r['label'] in ('chatter', 'transition')), None)
-            ramp_rows.append({'run_id': run['run_id'], 'n': summary['n'], 'F': summary['F'],
-                              'onset_ap': round(onset['ap'], 3) if onset else '',
-                              'max_ap': round(max(r['ap'] for r in cut), 3),
-                              'note': '' if onset else '채터 없음 (최대 깊이까지 안정)'})
+            ramp_rows.append(ramp_limit(run, cut))
         print(f"  {run['run_id']}: 윈도우 {len(rows)}개 (판정 구간 {len(cut)}, 채터 {len(chatter)}), 시각={timing}")
 
     os.makedirs(args.out, exist_ok=True)
@@ -186,9 +259,17 @@ def main():
             writer = csv.DictWriter(f, fieldnames=list(ramp_rows[0]))
             writer.writeheader()
             writer.writerows(ramp_rows)
-        limits = ",".join(f"{int(r['n'])}={r['onset_ap']}" for r in ramp_rows if r['onset_ap'] != '' and r['n'])
-        if limits:
-            print(f"안정 한계 추정 (grid --limits 입력값): {limits}")
+        # 같은 회전수를 여러 번 시험했으면 가장 얕은 시작 깊이 (보수적으로)
+        lowest = {}
+        for r in ramp_rows:
+            if r['onset_ap'] != '' and r['n']:
+                lowest[int(round(r['n']))] = min(r['onset_ap'], lowest.get(int(round(r['n'])), math.inf))
+        if lowest:
+            print(f"안정 한계 추정 (grid --limits 입력값): {','.join(f'{n}={ap}' for n, ap in sorted(lowest.items()))}")
+        shifts = [r['onset_shift_s'] for r in ramp_rows if r['onset_method'].startswith('signal')]
+        if shifts:
+            print(f"  ramp {len(ramp_rows)}개: 신호로 시작점을 다시 찾은 실행 {len(shifts)}개 (라벨보다 평균 {np.mean(shifts):.2f}초 앞), "
+                  f"중도절단 {sum(r['censored'] for r in ramp_rows)}개")
     print(f"데이터셋 저장: {args.out} (실행 {len(run_rows)}개, 윈도우 {len(all_rows)}개)")
 
 

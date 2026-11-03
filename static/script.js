@@ -1588,6 +1588,12 @@ function initEventListeners() {
     safeAddEventListener('decision-mode', 'change', function() {
         saveVibrationSettings({ decision_mode: this.value });
     });
+    safeAddEventListener('shadow-two-tier', 'change', function() {
+        saveVibrationSettings({ shadow_two_tier: this.checked });
+    });
+    safeAddEventListener('t2-alarm', 'change', function() {
+        saveVibrationSettings({ t2_alarm: this.checked });
+    });
 
     // 데이터 수집 창
     safeAddEventListener('recording-btn', 'click', function() {
@@ -2164,27 +2170,72 @@ function renderVibrationModelStatus(model, message) {
     let files = [];
 
     if (model && model.is_trained) {
-        summaryText = `진동 감지 모델: 학습됨 (정상 데이터 ${model.files.length}개 파일)`;
+        const profiles = model.profiles || {};
+        const fromDataset = Object.values(profiles).some(p => p.source === 'dataset');
+        summaryText = `진동 감지 모델: 학습됨 (정상 데이터 ${model.files.length}개 파일${fromDataset ? ' + 데이터셋 감지 모델' : ''})`;
         const thresholds = model.thresholds || {};
         const lines = [
             '상태: 학습됨',
             `학습 데이터: ${model.training_dir} (파일 ${model.files.length}개, 샘플 ${model.samples.toLocaleString()}개, 가공 윈도우 ${(model.windows || 0).toLocaleString()}개)`
         ];
+        // 창 설정별 감지 모델의 종류와 출처: 데이터셋 모델(scripts/train_models.py)이 있으면 그 창 설정에는 그 모델을 씀
+        const detectorFile = model.detector_model || {};
+        const trainedAt = detectorFile.trained_at ? `, ${detectorFile.trained_at.replace('T', ' ')} 학습` : '';
+        Object.values(profiles).forEach(p => {
+            const source = p.source === 'dataset'
+                ? `데이터셋 ${detectorFile.dataset || ''} (실행 ${p.sessions}개${trainedAt})`
+                : `학습 데이터 폴더 (파일 ${p.sessions}개)`;
+            lines.push(`감지 모델 ${p.label}: PCA-SPE, ${source}, 특징 ${p.features}개` +
+                (p.fs ? `, 센서 약 ${Math.round(p.fs)} Hz` : '') + (p.fs >= 400 && !p.nonharmonic ? ' (비고조파 비율 없음)' : ''));
+        });
         if (thresholds.rms_g !== null && thresholds.rms_g !== undefined) {
-            lines.push(`기준: 진동 크기 ${thresholds.rms_g.toFixed(3)} g, LOF 점수 ${thresholds.lof.toFixed(2)}` +
-                (thresholds.calibration === 'session_holdout' ? ' (파일 단위로 검증한 값)' : ''));
+            lines.push(`기준: 진동 크기 ${thresholds.rms_g.toFixed(3)} g, SPE ${thresholds.spe.toFixed(2)}, T² ${thresholds.t2.toFixed(1)}` +
+                (thresholds.calibration === 'session_holdout' ? ' (파일·실행 단위로 검증한 값)' : ''));
+        }
+        if (thresholds.features && thresholds.components) {
+            lines.push(`감지 모델: PCA (특징 ${thresholds.features.length}개 → 주성분 ${thresholds.components}개, ` +
+                `분산 ${Math.round(thresholds.explained * 100)}%). SPE는 경보에, T²는 학습 범위 밖 표시에 씀`);
         }
         const win = model.window || {};
         if (win.label) {
             lines.push(`판정 창: ${win.label}` +
-                (win.fallback ? ' (센서 샘플링에 맞는 창의 학습 데이터가 없어 이 모델로 감지 중 - 이 센서로 기록한 정상 데이터를 추가하세요)' : ''));
+                (win.fallback ? ' (센서 샘플링에 맞는 창의 학습 데이터가 없어 이 모델로 감지 중 - 이 센서로 기록한 정상 데이터를 추가하세요)' : '') +
+                (win.shadow ? ' · 2단계 판정은 기록만 하는 중 (감지 기록 Action=shadow)' : ''));
+        }
+        const s = model.settings || {};
+        if (s.confirm_sec !== undefined) {
+            const rule = {
+                k_of_n: `연속 초과 ${s.confirm_sec}초` + (win.n ? ` (윈도우 ${win.k}/${win.n}개)` : ''),
+                cusum: `누적합 CUSUM ${s.cusum_threshold}`,
+                two_tier: `2단계: 빠른 차단 기준선 ${s.fast_ratio}배 ${s.fast_sec}초 또는 CUSUM ${s.cusum_threshold}`,
+            }[s.decision_mode] || s.decision_mode;
+            lines.push(`판정 기준: ${rule}, 해제는 지표 ${s.release_level} 미만 ${s.release_sec}초, ` +
+                `대응 후 ${s.mitigation_wait_sec}초 안에 진정되지 않으면 정지 (재가공 ${s.rework_min_passes}패스 이상)`);
+        }
+        const t2Recent = model.t2_recent;
+        if (t2Recent) {
+            lines.push(`학습 범위 밖(T²): 최근 판정 ${Math.round(t2Recent.seconds)}초(윈도우 ${t2Recent.windows}개) 중 ${Math.round(t2Recent.fraction * 100)}%` +
+                (t2Recent.fraction >= 0.1 ? ' - 학습하지 않은 조건으로 보입니다. 이 조건의 정상 가공 데이터를 기록해 학습하세요' : ''));
+        } else if (model.t2_recent === null) {
+            lines.push('학습 범위 밖(T²): 아직 판정한 윈도우 없음');
+        }
+        const cm = model.condition_model;
+        if (cm && typeof cm === 'object') {
+            lines.push(`조건 모델: 실행 ${cm.runs}개, 상한 = 예측 × ${Number(cm.margin).toFixed(2)}` +
+                (cm.coverage !== null && cm.coverage !== undefined ? `, 상한 포함률 ${(cm.coverage * 100).toFixed(1)}%` : '') +
+                (cm.sensor_fs ? `, 센서 ${Math.round(cm.sensor_fs)} Hz` : ''));
         }
         const optimizerInfo = model.optimizer || {};
-        lines.push('재가공·온라인 대응 조건: ' + (optimizerInfo.model ? '채터 확률 모델' : '채터 확률 모델 없음 → 채터 주파수 또는 기본 규칙') +
-            (model.condition_model ? ', 조건 모델로 진동 크기 비교' : ''));
+        const sldRange = optimizerInfo.speed_range || [];
+        const sldText = optimizerInfo.sld
+            ? `안정 한계 모델 (ramp ${optimizerInfo.runs}개, ${optimizerInfo.tool_id ? optimizerInfo.tool_id + ' ' : ''}${optimizerInfo.flutes}날, ` +
+              `${Math.round(sldRange[0])}~${Math.round(sldRange[1])} rpm) → 채터 주파수 → 기본 규칙`
+            : '안정 한계 모델 없음 → 채터 주파수 또는 기본 규칙';
+        lines.push('재가공·온라인 대응 조건: ' + sldText + (model.condition_model ? ', 조건 모델로 진동 크기 비교' : ''));
         if (model.sensor && model.sensor.fs) {
             lines.push(`센서: ${model.sensor.device || ''} ${Math.round(model.sensor.fs)} Hz, ±${model.sensor.range_g} g`);
         }
+        (model.notes || []).forEach(note => lines.push('⚠️ ' + note));
         detailText = lines.join('\n');
         files = model.files;
     } else if (model) {
@@ -2213,6 +2264,10 @@ function renderVibrationModelStatus(model, message) {
         if (mitigation && document.activeElement !== mitigation) mitigation.checked = !!model.settings.mitigation_enabled;
         const mode = document.getElementById('decision-mode');
         if (mode && document.activeElement !== mode) mode.value = model.settings.decision_mode;
+        const shadow = document.getElementById('shadow-two-tier');
+        if (shadow && document.activeElement !== shadow) shadow.checked = !!model.settings.shadow_two_tier;
+        const t2Alarm = document.getElementById('t2-alarm');
+        if (t2Alarm && document.activeElement !== t2Alarm) t2Alarm.checked = !!model.settings.t2_alarm;
     }
 }
 
@@ -2255,10 +2310,19 @@ function renderVibrationLive(data) {
         } else {
             text = `· 지표 ${Number(data.evidence).toFixed(2)}`;
             level = data.alarm ? 'alarm' : (data.evidence >= 1 ? 'warn' : '');
+            if (data.t2 >= 1) text += ' · 학습 범위 밖 조건';
         }
     }
+    // 마우스를 올리면 항목별 값, T²(학습 범위), SPE 기여도가 큰 특징을 보여 줌
+    const details = data && data.parts ? Object.entries(data.parts).map(([k, v]) => `${k} ${v}`) : [];
+    if (data && data.t2 !== null && data.t2 !== undefined && !('t2' in (data.parts || {}))) {
+        details.push(`T² ${data.t2}` + (data.t2 >= 1 ? ' (학습 범위 밖)' : ''));
+    }
+    if (data && data.contributions && data.contributions.length) {
+        details.push('SPE 기여 ' + data.contributions.map(([name, share]) => `${name} ${Math.round(share * 100)}%`).join(' '));
+    }
     el.textContent = text;
-    el.title = data && data.parts ? Object.entries(data.parts).map(([k, v]) => `${k} ${v}`).join(', ') : '';
+    el.title = details.join(', ');
     el.classList.toggle('alarm', level === 'alarm');
     el.classList.toggle('warn', level === 'warn');
 }
@@ -2435,7 +2499,7 @@ function trainVibrationModel() {
 
 // 학습 데이터 폴더의 파일로 모델을 다시 학습하고 감지 상태 초기화
 function resetVibrationAnalyzer() {
-    if (!confirm('학습 데이터 폴더의 파일로 모델을 다시 학습하고 감지 버퍼를 비울까요?')) {
+    if (!confirm('models/의 학습된 모델(감지·조건·안정 한계)을 다시 읽고, 학습 데이터 폴더의 파일로 모델을 다시 학습한 뒤 감지 버퍼를 비울까요?')) {
         return;
     }
     requestVibrationModelChange('/api/vibration/reset', null, '학습 데이터 폴더로 모델을 다시 학습하는 중입니다...');

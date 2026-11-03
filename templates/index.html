@@ -305,12 +305,26 @@
                         <select id="decision-mode">
                             <option value="k_of_n">연속 초과 (1초 동안 계속 기준 초과)</option>
                             <option value="cusum">누적합 CUSUM (큰 이상은 더 빨리)</option>
+                            <option value="two_tier">2단계: 빠른 차단 + CUSUM (고속 센서)</option>
                         </select>
+                    </div>
+                    <div class="setting-row">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="shadow-two-tier">
+                            고속 센서에서 2단계 판정을 기록만 하기 (대응은 위 판정 방식으로, 실데이터 검증 전 비교용)
+                        </label>
+                    </div>
+                    <div class="setting-row">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="t2-alarm">
+                            학습 범위 밖(T²)도 경보에 쓰기 (끄면 표시만 함. 부하가 큰 정상 가공에서도 커질 수 있음)
+                        </label>
                     </div>
                 </div>
                 <div class="model-section">
                     <h5>모델 학습</h5>
                     <p>정상 가공 데이터(데이터 수집으로 기록한 data/raw/*_sensor.csv 또는 예전 '센서 데이터 저장' CSV, AccX·AccY·AccZ 열)를 학습 데이터 폴더에 추가하고, 폴더 전체로 모델을 다시 학습합니다. 파일 이름에 '이상'이 들어간 파일은 학습에서 제외됩니다.</p>
+                    <p>데이터 수집 기록으로 학습한 감지 모델(scripts/build_dataset.py → scripts/train_models.py, models/detector_model.joblib)이 있으면 그 창 설정에는 그 모델을 씁니다. 가공 기록의 회전수가 들어가 고속 센서에서는 비고조파 비율까지 씁니다. 새로 학습한 모델은 서버를 다시 시작하거나 '감지기 초기화'를 누르면 반영됩니다.</p>
                     <div class="input-group">
                         <label for="train-model-file">학습 데이터 파일 선택:</label>
                         <input type="file" id="train-model-file" accept=".csv">
@@ -319,7 +333,7 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button id="reset-vibration-analyzer" class="control-btn modal-btn" title="학습 데이터 폴더의 파일로 모델을 다시 학습하고 감지 버퍼를 비웁니다">감지기 초기화</button>
+                <button id="reset-vibration-analyzer" class="control-btn modal-btn" title="models/의 학습된 모델을 다시 읽고, 학습 데이터 폴더의 파일로 모델을 다시 학습한 뒤 감지 버퍼를 비웁니다">감지기 초기화</button>
                 <button id="cancel-vibration-settings" class="control-btn modal-btn">닫기</button>
             </div>
         </div>

@@ -7,6 +7,7 @@ import json
 import sys
 import csv
 import datetime
+import math
 import re
 from collections import deque
 from flask import Flask
@@ -127,6 +128,15 @@ base_feedrate = None    # 최초 F값
 OVERRIDE_RANGE = (10, 200)  # GRBL 오버라이드 허용 범위 (%)
 FEED_OVERRIDE_CMDS = {'reset': b'\x90', '+10': b'\x91', '-10': b'\x92', '+1': b'\x93', '-1': b'\x94'}
 SPINDLE_OVERRIDE_CMDS = {'reset': b'\x99', '+10': b'\x9A', '-10': b'\x9B', '+1': b'\x9C', '-1': b'\x9D'}
+# 오버라이드 전송 (edit_analysis2.md P07): GRBL은 처리 주기마다 들어온 리셋·±10·±1 명령을 함께 반영하지만 같은 명령은 한 번만
+# 셉니다. 그래서 종류가 다른 명령은 한 번에 보내고, 같은 명령을 다시 보낼 때만 간격을 둡니다.
+OVERRIDE_REPEAT_GAP = 0.015      # 같은 명령을 다시 보내기 전 간격 (초, 잠정값: 장비에서 Ov:로 확인)
+OVERRIDE_REPORT_SETTLE = 0.05    # 마지막 명령을 보내고 이만큼 지난 뒤 받은 상태 보고만 반영 결과로 봄 (그 전 보고는 이전 값일 수 있음)
+OVERRIDE_CONFIRM_TIMEOUT = 0.6   # 상태 보고(Ov:)로 반영을 확인할 때까지 기다리는 시간 (초, 가공 중 상태 조회는 0.2초마다)
+OVERRIDE_RETRIES = 1             # 반영된 값이 목표와 다르면 남은 차이만 다시 보내는 횟수
+reported_overrides = {'feed': None, 'spindle': None, 'time': 0.0}  # 상태 보고(Ov:)로 받은 마지막 값과 받은 시각
+override_reported = threading.Condition()  # Ov: 값을 받을 때마다 알림 (반영 확인 대기)
+override_lock = threading.Lock()            # 화면과 진동 감지기의 오버라이드 전송이 섞이지 않게
 
 # 진동 분석기 관련 변수
 vibration_monitor = None  # VibrationMonitor 인스턴스를 저장할 변수
@@ -255,14 +265,22 @@ def machine_snapshot():
         'spindle_override': spindle_override, 'feed_override': feed_override,
         'n_eff': n_eff, 'F_eff': F_eff,
         'feed_rt': status.get('feed'), 'spindle_rt': status.get('spindle'),
-        'line': gcode_current_idx, 'flutes': flutes,
+        'line': gcode_current_idx, 'flutes': flutes, 'tool_id': program_meta.get('tool'),
     }
 
 def _remember_status(status):
-    """마지막 GRBL 상태를 저장하고, 데이터 수집 중이면 가공 로그에 한 줄 남깁니다."""
-    global last_grbl_status, last_grbl_status_time
+    """마지막 GRBL 상태를 저장하고, 오버라이드 값(Ov:)을 반영하며, 데이터 수집 중이면 가공 로그에 한 줄 남깁니다."""
+    global last_grbl_status, last_grbl_status_time, feed_override, spindle_override
     last_grbl_status = status
     last_grbl_status_time = time.time()
+    ov = status.get('ov')
+    if ov:
+        with override_reported:
+            reported_overrides.update(feed=ov[0], spindle=ov[2], time=last_grbl_status_time)
+            override_reported.notify_all()
+        if ov[0] != feed_override or ov[2] != spindle_override:
+            feed_override, spindle_override = ov[0], ov[2]
+            socketio.emit('override_status', {'spindle': spindle_override, 'feed': feed_override})
     if run_recorder.active:
         run_recorder.add_machine(machine_snapshot())
 
@@ -1273,47 +1291,156 @@ def stop_recording():
     socketio.emit('recording_status', recording_status())
     return ok, message
 
-def apply_override(target, value):
-    """GRBL 1.1 실시간 명령으로 Feed/Spindle 오버라이드를 value(%)로 설정합니다.
+def override_plan(current, target):
+    """오버라이드를 current% → target%로 바꾸는 GRBL 명령을 처리 주기별로 나눕니다 → [['reset', '-10'], ['-10'], ...]
 
-    GRBL에는 절대값 설정 명령이 없으므로 100%로 리셋한 뒤 ±10%, ±1% 단계 명령을 필요한 만큼 보냅니다.
-    (같은 명령이 GRBL 메인 루프 한 주기 안에 겹치면 한 번으로 처리되므로 명령 사이에 간격을 둡니다)
+    한 주기에는 리셋·±10·±1을 하나씩만 넣을 수 있으므로 주기 수는 가장 많이 반복하는 명령의 횟수입니다.
+    현재 값에서 바로 가는 길(±10 횟수를 내림·올림·버림한 세 가지)과 100%로 리셋한 뒤 가는 길 중, 주기가 적고 명령이 적은
+    길을 고릅니다. 주기가 끝날 때의 값이 허용 범위(10–200%)를 벗어나는 길은 뺍니다(GRBL이 주기마다 범위로 잘라 목표에 닿지 않음).
+    current를 모르면(None) 리셋부터 합니다.
+    """
+    low, high = OVERRIDE_RANGE
+    plans = []
+    for start, reset in ((current, False), (100, True)):
+        if start is None:
+            continue
+        delta = target - start
+        for coarse in {math.floor(delta / 10), math.ceil(delta / 10), int(delta / 10)}:
+            fine = delta - 10 * coarse
+            batches, value = [], start
+            for i in range(max(abs(coarse), abs(fine), int(reset))):
+                batch = ['reset'] if reset and i == 0 else []
+                if i < abs(coarse):
+                    batch.append('+10' if coarse > 0 else '-10')
+                if i < abs(fine):
+                    batch.append('+1' if fine > 0 else '-1')
+                value += sum(int(step) for step in batch if step != 'reset')
+                batches.append(batch)
+                if not low <= value <= high:
+                    break
+            else:
+                plans.append((len(batches), sum(map(len, batches)), reset, batches))
+    return min(plans)[3]
+
+
+def _wait_for_overrides(values, settled_after, timeout):
+    """상태 보고(Ov:)의 오버라이드가 values와 같아지거나, settled_after 이후에 받은 보고가 다르거나, timeout이 지날 때까지
+    기다립니다 → (같은지, settled_after 이후에 받은 마지막 값 또는 None)"""
+    deadline = time.time() + timeout
+    with override_reported:
+        while True:
+            report = dict(reported_overrides)
+            settled = report if report['time'] >= settled_after else None
+            if all(report[target] == value for target, value in values.items()):
+                return True, report
+            remaining = deadline - time.time()
+            if settled or remaining <= 0:
+                return False, settled
+            override_reported.wait(remaining)
+
+
+def apply_overrides(targets):
+    """Feed/Spindle 오버라이드를 목표값(%)으로 바꿉니다. targets 예: {'feed': 80, 'spindle': 110} (edit_analysis2.md P07)
+
+    - 상태 보고(Ov:)의 현재 값에서 필요한 명령만 보냅니다(override_plan). 예전처럼 매번 100%로 리셋하지 않습니다.
+    - 처리 주기마다 이송 명령을 먼저, 스핀들 명령을 다음에 한 번에 보내고, 같은 명령을 다시 보낼 때만 OVERRIDE_REPEAT_GAP만큼 쉽니다.
+    - 보낸 뒤 상태 보고로 반영을 확인합니다. 가공 중에는 스트리밍 스레드의 상태 조회를 기다리고, 아니면 직접 조회합니다.
+    - 반영된 값이 다르면 남은 차이만 다시 보냅니다(OVERRIDE_RETRIES). 보낸 뒤의 상태 보고를 받지 못했으면 다시 보내지 않습니다
+      (상대 명령이라 이미 반영된 명령을 두 번 적용할 수 있기 때문).
+    반환: {'status', 'message', 'values': {대상: 설정값}, 'clamped': [범위로 조정한 대상], 'sent_at', 'confirmed_at'
+           (확인하지 못하면 None), 'confirmed', 'commands': 보낸 명령 수, 'retries'}
     """
     global feed_override, spindle_override
-    commands = {'feed': FEED_OVERRIDE_CMDS, 'spindle': SPINDLE_OVERRIDE_CMDS}.get(target)
-    if commands is None:
-        return {"status": "error", "message": f"알 수 없는 오버라이드 대상: {target}"}
+    tables = {'feed': FEED_OVERRIDE_CMDS, 'spindle': SPINDLE_OVERRIDE_CMDS}
+    unknown = [target for target in targets if target not in tables]
+    if unknown:
+        return {"status": "error", "message": f"알 수 없는 오버라이드 대상: {', '.join(unknown)}"}
+    values, clamped = {}, []
+    for target in ('feed', 'spindle'):  # 이송 명령을 먼저 보냄 (회전수 변경보다 바로 반영되는 쪽)
+        if target not in targets:
+            continue
+        try:
+            requested = int(round(float(targets[target])))
+        except (TypeError, ValueError):
+            return {"status": "error", "message": f"잘못된 오버라이드 값: {targets[target]}"}
+        values[target] = max(OVERRIDE_RANGE[0], min(OVERRIDE_RANGE[1], requested))
+        if values[target] != requested:
+            clamped.append(target)
     if not ser or not ser.is_open:
         return {"status": "error", "message": "시리얼 포트가 연결되지 않았습니다."}
-    try:
-        requested = int(round(float(value)))
-    except (TypeError, ValueError):
-        return {"status": "error", "message": f"잘못된 오버라이드 값: {value}"}
 
-    clamped = max(OVERRIDE_RANGE[0], min(OVERRIDE_RANGE[1], requested))
-    diff = clamped - 100
-    sign = '+' if diff > 0 else '-'
-    sequence = [commands['reset']] + [commands[sign + '10']] * (abs(diff) // 10) + [commands[sign + '1']] * (abs(diff) % 10)
-    try:
-        for command in sequence:
-            with ser_lock:
-                ser.write(command)
-                ser.flush()
-            time.sleep(0.03)
-    except Exception as e:
-        return {"status": "error", "message": f"오버라이드 명령 전송 실패: {str(e)}"}
+    sent_at = confirmed_at = None
+    commands = retries = 0
+    with override_lock:
+        if not job_active:  # 리셋 직후처럼 마지막 보고가 오래됐을 수 있어 먼저 상태를 조회 (가공 중에는 0.2초마다 갱신됨)
+            status = query_status(timeout=OVERRIDE_CONFIRM_TIMEOUT)
+            if status:
+                _remember_status(status)
+        with override_reported:
+            current = dict(reported_overrides)
+        for attempt in range(OVERRIDE_RETRIES + 1):
+            plans = {target: override_plan(current[target], value) for target, value in values.items()}
+            if not any(plans.values()):
+                confirmed_at = time.time()
+                break
+            cycles = max(len(plan) for plan in plans.values())
+            try:
+                for i in range(cycles):
+                    if i:
+                        time.sleep(OVERRIDE_REPEAT_GAP)
+                    data = b''.join(tables[target][step] for target, plan in plans.items() if i < len(plan)
+                                    for step in plan[i])
+                    with ser_lock:
+                        ser.write(data)
+                        ser.flush()
+                    sent_at = sent_at or time.time()
+                    commands += len(data)
+            except Exception as e:
+                return {"status": "error", "message": f"오버라이드 명령 전송 실패: {str(e)}"}
+            feed_override = values.get('feed', feed_override)
+            spindle_override = values.get('spindle', spindle_override)
+            socketio.emit('override_status', {'spindle': spindle_override, 'feed': feed_override})
 
-    if target == 'feed':
-        feed_override = clamped
+            settled_after = time.time() + OVERRIDE_REPORT_SETTLE
+            if not job_active:  # 스트리밍 스레드가 상태를 조회하지 않으므로 직접 조회
+                time.sleep(OVERRIDE_REPORT_SETTLE)
+                status = query_status(timeout=OVERRIDE_CONFIRM_TIMEOUT)
+                if status:
+                    _remember_status(status)
+            matched, report = _wait_for_overrides(values, settled_after, OVERRIDE_CONFIRM_TIMEOUT)
+            if matched:
+                confirmed_at = time.time()
+                break
+            if report is None or attempt == OVERRIDE_RETRIES:
+                break
+            current = report
+            retries += 1
+
+    shown = ", ".join(f"{'이송' if target == 'feed' else '스핀들'} {value}%" for target, value in values.items())
+    if confirmed_at and sent_at:
+        message = f"오버라이드 {shown} 반영 확인 ({confirmed_at - sent_at:.2f}초, 명령 {commands}개)"
+    elif confirmed_at:
+        message = f"오버라이드 {shown} (이미 그 값)"
     else:
-        spindle_override = clamped
-    socketio.emit('override_status', {'spindle': spindle_override, 'feed': feed_override})
+        message = f"오버라이드 {shown} 전송 (상태 보고로 반영을 확인하지 못함)"
+    return {"status": "success", "message": message, "values": values, "clamped": clamped, "sent_at": sent_at,
+            "confirmed_at": confirmed_at, "confirmed": confirmed_at is not None, "commands": commands, "retries": retries}
 
-    label = 'Feed' if target == 'feed' else 'Spindle'
-    message = f"{label} Override {clamped}% 설정됨"
-    if clamped != requested:
+
+def apply_override(target, value):
+    """Feed 또는 Spindle 오버라이드 하나를 value(%)로 설정합니다 (화면의 오버라이드 입력, apply_overrides 참고)."""
+    if target not in ('feed', 'spindle'):
+        return {"status": "error", "message": f"알 수 없는 오버라이드 대상: {target}"}
+    result = apply_overrides({target: value})
+    if result['status'] != 'success':
+        return result
+    value = result['values'][target]
+    message = f"{'Feed' if target == 'feed' else 'Spindle'} Override {value}% 설정됨"
+    if target in result['clamped']:
         message += f" (GRBL 허용 범위 {OVERRIDE_RANGE[0]}~{OVERRIDE_RANGE[1]}%로 조정)"
-    return {"status": "success", "message": message, "value": clamped}
+    if not result['confirmed']:
+        message += " (상태 보고로 반영을 확인하지 못함)"
+    return dict(result, message=message, value=value)
 
 def _read_serial_lines(rx, wait=0.02):
     """도착한 데이터를 읽어 완성된 줄 목록을 반환합니다 (끝나지 않은 줄은 rx에 보관)."""
@@ -1334,8 +1461,7 @@ def _read_serial_lines(rx, wait=0.02):
     return lines
 
 def _apply_job_status(status):
-    """가공 중 상태 보고로 실제 좌표 경로, CSV 로그, 오버라이드 표시를 갱신합니다."""
-    global feed_override, spindle_override
+    """가공 중 상태 보고로 실제 좌표 경로, CSV 로그, 오버라이드 표시(_remember_status)를 갱신합니다."""
     work = status.get('work')
     if work:
         x, y, z = (round(v, 4) for v in work)
@@ -1344,10 +1470,6 @@ def _apply_job_status(status):
             y_vals.append(y)
             z_vals.append(z)
             log_process_data()
-    ov = status.get('ov')
-    if ov and (ov[0] != feed_override or ov[2] != spindle_override):
-        feed_override, spindle_override = ov[0], ov[2]
-        socketio.emit('override_status', {'spindle': spindle_override, 'feed': feed_override})
     _remember_status(status)
     update_ui()
 

@@ -58,8 +58,9 @@ const flush = () => new Promise(r => setImmediate(r));
 const json = (body) => Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
 const $ = (id) => document.getElementById(id);
 const trained = { is_trained: true, is_training: false, training_dir: 'data/학습 데이터', files: ['a.csv', 'b.csv'], samples: 123456,
-    windows: 4567, thresholds: { rms_g: 0.65, lof: 3.49, calibration: 'session_holdout' },
-    settings: { mitigation_enabled: true, decision_mode: 'k_of_n' }, optimizer: { model: false }, condition_model: false,
+    windows: 4567, thresholds: { rms_g: 0.65, spe: 1.23, t2: 31.5, calibration: 'session_holdout',
+        features: ['rms_x', 'rms_y', 'rms_z', 'kurt_x', 'kurt_y', 'kurt_z', 'crest_x', 'crest_y', 'crest_z'], components: 7, explained: 0.993 },
+    settings: { mitigation_enabled: true, decision_mode: 'k_of_n', shadow_two_tier: false, t2_alarm: false }, optimizer: { sld: false, methods: ['chatter_frequency', 'fallback'] }, condition_model: false,
     sensor: { device: 'MPU6050', fs: 1000, range_g: 8 },
     window: { profile: 'legacy', label: '1초 창·0.25초 간격', stream_profile: 'fast', fallback: true, window_sec: 1.0, hop_sec: 0.25 } };
 
@@ -79,12 +80,17 @@ const trained = { is_trained: true, is_training: false, training_dir: 'data/학�
     await flush();
     check('trained summary shown after retry', $('vibration-status-text').textContent === '진동 감지 모델: 학습됨 (정상 데이터 2개 파일)', $('vibration-status-text').textContent);
     check('detail lists counts, thresholds, condition source and sensor', $('vibration-model-status').textContent.includes('샘플 123,456개') &&
-          $('vibration-model-status').textContent.includes('0.650 g') && $('vibration-model-status').textContent.includes('기본 규칙') &&
+          $('vibration-model-status').textContent.includes('0.650 g') &&
+          $('vibration-model-status').textContent.includes('안정 한계 모델 없음 → 채터 주파수 또는 기본 규칙') &&
           $('vibration-model-status').textContent.includes('1000 Hz'), $('vibration-model-status').textContent);
+    check('PCA detector shown: SPE / T² thresholds, features -> components', $('vibration-model-status').textContent.includes('SPE 1.23, T² 31.5') &&
+          $('vibration-model-status').textContent.includes('특징 9개 → 주성분 7개, 분산 99%') && !$('vibration-model-status').textContent.includes('LOF'),
+          $('vibration-model-status').textContent);
     check('window setting in use shown, with a note when the sensor has no model of its own window setting',
           $('vibration-model-status').textContent.includes('판정 창: 1초 창·0.25초 간격') &&
           $('vibration-model-status').textContent.includes('학습 데이터가 없어'), $('vibration-model-status').textContent);
-    check('settings controls reflect the server', $('mitigation-enabled').checked === true && $('decision-mode').value === 'k_of_n');
+    check('settings controls reflect the server', $('mitigation-enabled').checked === true && $('decision-mode').value === 'k_of_n'
+          && $('shadow-two-tier').checked === false && $('t2-alarm').checked === false);
     check('file list rendered as text', $('vibration-model-files').textContent === 'a.csv\nb.csv');
 
     // open button
@@ -122,12 +128,45 @@ const trained = { is_trained: true, is_training: false, training_dir: 'data/학�
           !$('train-model-btn').disabled && $('train-model-file').value !== '');
     check('error without model -> status refreshed from server', fetchCalls[fetchCalls.length - 1].url === '/api/vibration/model');
 
-    // success clears the selection and renders the returned model
-    const updated = { ...trained, files: ['a.csv', 'b.csv', '정상.csv'] };
+    // success clears the selection and renders the returned model (this time with a stability-limit model, P11)
+    const updated = { ...trained, files: ['a.csv', 'b.csv', '정상.csv'],
+        optimizer: { sld: true, methods: ['sld', 'chatter_frequency', 'fallback'], runs: 18, speed_range: [16000, 24000], flutes: 2,
+            tool_id: 'T1', kappa: 1.645 } };
     responder = (url) => json({ status: 'success', message: '정상.csv을(를) 추가했습니다.', model: updated });
     trainHandlers.forEach(fn => fn());
     await flush(); await flush();
     check('success -> file input cleared, 3 files shown', $('train-model-file').value === '' && $('vibration-status-text').textContent.includes('3개 파일'));
+    check('stability-limit model shown with its ramp count, tool and speed range',
+          $('vibration-model-status').textContent.includes('안정 한계 모델 (ramp 18개, T1 2날, 16000~24000 rpm) → 채터 주파수 → 기본 규칙'),
+          $('vibration-model-status').textContent);
+
+    // P12: dataset detector model per window setting, decision thresholds, share outside the training range, condition model, notes
+    const p12 = { ...trained, files: ['a.csv'],
+        profiles: { legacy: { label: '1초 창·0.25초 간격', source: 'folder', sessions: 1, windows: 300, fs: 90, features: 9, nonharmonic: false },
+            fast: { label: '0.2초 창·0.05초 간격', source: 'dataset', sessions: 24, windows: 9000, fs: 1000, features: 11, nonharmonic: true } },
+        detector_model: { path: 'models/detector_model.joblib', dataset: 'data/dataset', trained_at: '2026-11-03T10:00:00', profiles: ['fast'] },
+        settings: { mitigation_enabled: true, decision_mode: 'k_of_n', shadow_two_tier: true, t2_alarm: false, confirm_sec: 0.75,
+            release_sec: 0.75, release_level: 0.8, cusum_threshold: 0.3, fast_ratio: 3.0, fast_sec: 0.15, mitigation_wait_sec: 4.0, rework_min_passes: 2 },
+        window: { profile: 'fast', label: '0.2초 창·0.05초 간격', stream_profile: 'fast', fallback: false, window_sec: 0.2, hop_sec: 0.05,
+            k: 16, n: 16, fast_blocks: 3, shadow: true },
+        t2_recent: { fraction: 0.25, windows: 1200, seconds: 60 },
+        condition_model: { runs: 108, coverage: 0.988, margin: 1.64, sensor_fs: 1000, trained_at: '2026-11-02T20:00:00' },
+        notes: ['조건 모델은 1000 Hz 센서로 학습되어 지금 센서(1600 Hz)에서는 쓰지 않습니다.'] };
+    sandbox.renderVibrationModelStatus(p12);
+    const text12 = $('vibration-model-status').textContent;
+    check('model window (P12): detector type and source per window setting, decision thresholds, T² share with advice, condition model, notes',
+          $('vibration-status-text').textContent === '진동 감지 모델: 학습됨 (정상 데이터 1개 파일 + 데이터셋 감지 모델)' &&
+          text12.includes('감지 모델 0.2초 창·0.05초 간격: PCA-SPE, 데이터셋 data/dataset (실행 24개, 2026-11-03 10:00:00 학습), 특징 11개, 센서 약 1000 Hz') &&
+          text12.includes('감지 모델 1초 창·0.25초 간격: PCA-SPE, 학습 데이터 폴더 (파일 1개), 특징 9개') &&
+          text12.includes('판정 기준: 연속 초과 0.75초 (윈도우 16/16개), 해제는 지표 0.8 미만 0.75초') &&
+          text12.includes('학습 범위 밖(T²): 최근 판정 60초(윈도우 1200개) 중 25% - 학습하지 않은 조건') &&
+          text12.includes('조건 모델: 실행 108개, 상한 = 예측 × 1.64, 상한 포함률 98.8%, 센서 1000 Hz') &&
+          text12.includes('⚠️ 조건 모델은 1000 Hz 센서로 학습되어'), text12);
+    sandbox.renderVibrationModelStatus({ ...p12, t2_recent: null, notes: [],
+        profiles: { fast: { ...p12.profiles.fast, nonharmonic: false } } });
+    const text12b = $('vibration-model-status').textContent;
+    check('no judged windows yet -> the T² line says so; a fast model without the non-harmonic ratio is marked',
+          text12b.includes('학습 범위 밖(T²): 아직 판정한 윈도우 없음') && text12b.includes('(비고조파 비율 없음)') && !text12b.includes('⚠️'), text12b);
 
     // reset
     responder = (url) => json({ status: 'success', message: '초기화했습니다.', model: { ...trained, is_trained: false, files: [] } });
@@ -156,10 +195,26 @@ const trained = { is_trained: true, is_training: false, training_dir: 'data/학�
     const settingsReq = fetchCalls[fetchCalls.length - 1];
     check('mitigation toggle posts JSON to /api/vibration/settings', settingsReq.url === '/api/vibration/settings' &&
           JSON.parse(settingsReq.opts.body).mitigation_enabled === false);
+    $('shadow-two-tier').checked = true;
+    ($('shadow-two-tier').listeners.change || []).forEach(fn => fn.call($('shadow-two-tier')));
+    await flush(); await flush();
+    const shadowReq = fetchCalls[fetchCalls.length - 1];
+    check('record-only two-tier toggle posts shadow_two_tier', shadowReq.url === '/api/vibration/settings' &&
+          JSON.parse(shadowReq.opts.body).shadow_two_tier === true);
+    $('t2-alarm').checked = true;
+    ($('t2-alarm').listeners.change || []).forEach(fn => fn.call($('t2-alarm')));
+    await flush(); await flush();
+    const t2Req = fetchCalls[fetchCalls.length - 1];
+    check('T² alarm toggle posts t2_alarm', t2Req.url === '/api/vibration/settings' && JSON.parse(t2Req.opts.body).t2_alarm === true);
 
     // live indicator from the server
     socketHandlers['vibration_status']({ evidence: 0.42, gate: true, alarm: false, stage: null, parts: { level: 0.42 } });
     check('live evidence shown', $('vibration-live-text').textContent === '· 지표 0.42' && !$('vibration-live-text').classList.contains('alarm'));
+    socketHandlers['vibration_status']({ evidence: 0.7, gate: true, alarm: false, stage: null, parts: { spe: 0.7, level: 0.5 }, t2: 1.4,
+        contributions: [['kurt_z', 0.46], ['rms_z', 0.21]] });
+    check('outside the training range (T² >= 1) flagged; hover lists T² and the largest SPE contributions',
+          $('vibration-live-text').textContent === '· 지표 0.70 · 학습 범위 밖 조건' && $('vibration-live-text').title.includes('T² 1.4 (학습 범위 밖)') &&
+          $('vibration-live-text').title.includes('SPE 기여 kurt_z 46% rms_z 21%'), $('vibration-live-text').title);
     socketHandlers['vibration_status']({ evidence: 1.8, gate: true, alarm: true, stage: 'mitigating', parts: {} });
     check('mitigation stage highlighted', $('vibration-live-text').textContent.includes('온라인 대응') && $('vibration-live-text').classList.contains('warn'));
     socketHandlers['vibration_status']({ evidence: null, gate: false, alarm: false, stage: null, parts: {} });

@@ -63,6 +63,8 @@ class FakeGrbl:
         self.executed_moves = []        # (line, start, end)
         self.overflows = 0
         self.realtime_log = []
+        self.realtime_times = []        # time.time() of each realtime byte, same order as realtime_log
+        self.drop_override_bytes = 0    # fault injection: ignore this many upcoming override bytes (lost command)
         self.resets = 0
 
         self._stop = False
@@ -146,6 +148,7 @@ class FakeGrbl:
 
     def _realtime(self, b):
         self.realtime_log.append(b)
+        self.realtime_times.append(time.time())
         if b == 0x3F:  # '?'
             self._status_report()
         elif b == 0x21:  # '!'
@@ -158,7 +161,10 @@ class FakeGrbl:
         elif b == 0x18:
             self._soft_reset()
         elif 0x90 <= b <= 0x9D:
-            self.ov_flags.add(b)
+            if self.drop_override_bytes:
+                self.drop_override_bytes -= 1
+            else:
+                self.ov_flags.add(b)
         elif b == 0x9E:  # toggle spindle stop: only while holding
             if self.hold:
                 self.spindle_on = False
@@ -174,6 +180,7 @@ class FakeGrbl:
         self.hold = False
         self.spindle_on = False
         self.feed_ov = self.spindle_ov = 100
+        self.report_ov_next = True      # GRBL reports Ov in the first status report after a reset
         self.modal_motion = 0
         self.absolute = True
         self._send("")

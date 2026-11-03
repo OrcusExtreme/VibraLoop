@@ -9,3 +9,11 @@
 
 자세한 분석은 [edit_analysis.md](../../edit_analysis.md) 2.7, 대체 방법은 `src/optimizer.py`와 `scripts/train_models.py`를 참고하세요.
 비교·발표 자료용으로만 보관하며, scikit-learn 1.9.1로 다시 저장된 상태입니다 (원본은 커밋 `861c3b2`).
+
+## 학습할 때 옮겨지는 예전 모델
+
+`scripts/train_models.py`는 쓰지 않는 형식의 모델을 지우거나 덮어쓰지 않고 이 폴더로 옮깁니다(edit_analysis2.md P12).
+이름이 겹치면 뒤에 옮긴 시각을 붙입니다. 이 PC에서 학습한 파일이라 저장소에는 들어 있지 않습니다.
+
+- `stability_model.joblib`: 예전 채터 확률 모델(GPC). P11에서 안정 한계 모델(`models/sld_gpr_model.joblib`)로 바꿨습니다.
+- 저장 경로에 있던 다른 형식의 모델: 예를 들어 P09 이전 형식의 조건 모델(`condition_model.joblib`, z 점수 방식)

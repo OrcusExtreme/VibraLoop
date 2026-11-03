@@ -76,19 +76,54 @@ def check_packages():
         ok(f"requirements.txt의 패키지 {len(pins)}개가 모두 지정 버전으로 설치됨")
 
 
+def check_detector_model(bundle, name, label):
+    """데이터셋 감지 모델 묶음(scripts/train_models.py, P12): 형식·특징 계산 방식을 확인하고, 창 설정마다 학습 데이터
+    중심의 윈도우를 채점해 SPE·T²가 유한한지 봅니다."""
+    import numpy as np
+    import features
+    from vibration_monitor import DETECTOR_MODEL_KIND, PROFILE_LABELS, pca_scores
+
+    if not isinstance(bundle, dict) or bundle.get('kind') != DETECTOR_MODEL_KIND or not bundle.get('models'):
+        fail(f"models/{name}의 형식이 맞지 않아 쓰지 않습니다. scripts/train_models.py로 다시 학습하세요.")
+        return
+    if bundle.get('feature_version') != features.FEATURE_VERSION:
+        fail(f"models/{name}은 특징 계산 방식이 지금과 달라 쓰지 않습니다. "
+             "scripts/build_dataset.py → scripts/train_models.py로 다시 학습하세요.")
+        return
+    parts = []
+    for profile, model in sorted(bundle['models'].items()):
+        spe, t2, _ = pca_scores(model['pca'], model['pca']['mean'])
+        if not (np.isfinite(spe[0]) and np.isfinite(t2[0])):
+            fail(f"models/{name}의 {PROFILE_LABELS.get(profile, profile)} 모델 채점 결과가 올바르지 않습니다: SPE {spe[0]}, T² {t2[0]}")
+            return
+        parts.append(f"{PROFILE_LABELS.get(profile, profile)}: 실행 {model['sessions']}개, 특징 {len(model['feature_names'])}개")
+    ok(f"{label}(models/{name}) 로드·채점 정상 ({'; '.join(parts)}, {bundle.get('dataset')}, {bundle.get('trained_at')})")
+
+
 def check_models():
     """scripts/train_models.py로 학습한 모델(있으면)을 불러와 버전 경고와 예측을 확인합니다."""
     import joblib
     import numpy as np
     from sklearn.exceptions import InconsistentVersionWarning
+    if os.path.join(BASE_DIR, 'src') not in sys.path:
+        sys.path.insert(0, os.path.join(BASE_DIR, 'src'))
+    from vibration_monitor import CONDITION_MODEL_KIND
 
     model_dir = os.path.join(BASE_DIR, 'models')
-    found = False
-    for name, label in (('stability_model.joblib', '채터 확률 모델'), ('condition_model.joblib', '조건 모델')):
+    missing = []
+    if os.path.exists(os.path.join(model_dir, 'stability_model.joblib')):
+        caution("models/stability_model.joblib(예전 채터 확률 모델)은 P11부터 쓰지 않습니다. scripts/train_models.py를 "
+                "실행하면 models/legacy/로 옮기며, 직접 옮기거나 지워도 됩니다. "
+                "재가공·온라인 대응 조건은 안정 한계 모델(models/sld_gpr_model.joblib)로 정합니다.")
+    for name, label, without in (('detector_model.joblib', '데이터셋 감지 모델',
+                                  "서버 시작 때 학습 데이터 폴더의 CSV로만 감지 모델을 학습하고(고속 센서는 비고조파 비율 없이)"),
+                                 ('condition_model.joblib', '조건 모델', "감지에 조건 항목을 쓰지 않고"),
+                                 ('sld_gpr_model.joblib', '안정 한계 모델',
+                                  "재가공·온라인 대응 조건은 채터 주파수 또는 기본 규칙으로 정하고")):
         path = os.path.join(model_dir, name)
         if not os.path.exists(path):
+            missing.append(f"{label}이 없어 {without}")
             continue
-        found = True
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
             bundle = joblib.load(path)
@@ -97,19 +132,44 @@ def check_models():
             fail(f"models/{name}이 다른 scikit-learn 버전으로 저장되어 결과를 믿을 수 없습니다. "
                  f"scripts/train_models.py로 다시 학습하세요: {version_warnings[0].message}")
             continue
+        if name == 'detector_model.joblib':
+            check_detector_model(bundle, name, label)
+            continue
+        if name == 'condition_model.joblib' and bundle.get('kind') != CONDITION_MODEL_KIND:
+            fail(f"models/{name}이 예전 형식(P09 이전)이라 감지에 쓰지 않습니다. scripts/train_models.py로 다시 학습하세요 "
+                 "(예전 파일은 models/legacy/로 옮깁니다).")
+            continue
+        # 학습 범위의 가운데 조건으로 예측해 봄 (범위를 모르면 20000 rpm, 100 mm/min, 0.3 mm)
         example = {'n': 20000.0, 'F': 100.0, 'ap': 0.3}
+        example.update({key: (low + high) / 2 for key, (low, high) in (bundle.get('training_range') or {}).items()})
         X = np.array([[example[name] for name in bundle['features']]])
-        if bundle.get('scaler') is not None:
-            X = bundle['scaler'].transform(X)
-        model = bundle['model']
-        value = model.predict_proba(X)[0, -1] if hasattr(model, 'predict_proba') else model.predict(X)[0]
+        value = bundle['model'].predict(X)[0]
+        coverage = bundle.get('coverage')
+        detail = f", 상한 포함률 {coverage:.1%}" if coverage is not None else ""
         if not np.isfinite(value):
             fail(f"models/{name} 예측 결과가 올바르지 않습니다: {value}")
         else:
-            ok(f"{label}(models/{name}) 로드·예측 정상 (실행 {bundle.get('n_runs')}개로 학습, {bundle.get('trained_at')})")
-    if not found:
-        caution("학습된 채터 확률·조건 모델이 없어 재가공·온라인 대응 조건은 채터 주파수 또는 기본 규칙으로 정합니다. "
+            ok(f"{label}(models/{name}) 로드·예측 정상 (실행 {bundle.get('n_runs')}개로 학습{detail}, {bundle.get('trained_at')})")
+    if missing:
+        caution(", ".join(missing) + " 있습니다. "
                 "데이터를 수집한 뒤 scripts/build_dataset.py → scripts/train_models.py로 학습하세요.")
+
+
+def check_settings():
+    """모델 관리 창에서 저장한 감지 설정(data/detector_settings.json)을 서버와 같은 규칙(setting_problem)으로 검사합니다."""
+    if os.path.join(BASE_DIR, 'src') not in sys.path:
+        sys.path.insert(0, os.path.join(BASE_DIR, 'src'))
+    from vibration_monitor import SETTINGS_PATH, load_settings
+
+    if not os.path.exists(SETTINGS_PATH):
+        ok("저장된 감지 설정 없음: 기본값으로 감지합니다 (data/detector_settings.json)")
+        return
+    settings, problems = load_settings(SETTINGS_PATH)
+    if problems:
+        caution("data/detector_settings.json에 쓰지 않는 값이 있어 그 항목은 기본값을 씁니다: " + "; ".join(problems)
+                + " (모델 관리 창에서 설정을 다시 저장하면 고쳐집니다)")
+    else:
+        ok("저장된 감지 설정 정상: " + ", ".join(f"{key}={value}" for key, value in settings.items()))
 
 
 def check_training_data():
@@ -170,7 +230,7 @@ def main():
         pass
     print(f"ProjectLab_System 실행 환경 점검: {BASE_DIR}")
     check_python()
-    for check in (check_packages, check_models, check_training_data, check_web_assets, check_serial, check_app):
+    for check in (check_packages, check_models, check_settings, check_training_data, check_web_assets, check_serial, check_app):
         try:
             check()
         except Exception as e:

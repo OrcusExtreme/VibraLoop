@@ -42,8 +42,10 @@ WINDOW_PROFILES = {
     'fast': {'window_sec': 0.2, 'hop_sec': 0.05, 'block_sec': 0.05},     # 고속 펌웨어 (1 kHz에서 창당 200샘플)
 }
 
-# LOF 입력 순서 (모두 로그 변환)
+# 감지 모델(PCA) 입력: 진동 크기 특징 9개 (모두 로그 변환)
 TIME_FEATURE_NAMES = ['rms_x', 'rms_y', 'rms_z', 'kurt_x', 'kurt_y', 'kurt_z', 'crest_x', 'crest_y', 'crest_z']
+# 고속 창 설정에서 더하는 주파수 특징 (0–1 비율이라 로그 변환하지 않음). 학습 윈도우에 있을 때만 씁니다.
+SPECTRAL_FEATURE_NAMES = ['spectral_entropy', 'nonharmonic_ratio']
 _EPS = 1e-9
 
 
@@ -227,9 +229,41 @@ def compute_features(acc, t, config, spindle_rpm=None):
     return feats
 
 
+def cutting_physics(n, F, ap, flutes, ae=None):
+    """절삭 조건의 물리 변수 (edit_analysis2.md P09). 회전수·이송·깊이·날 수 중 하나라도 모르면 None.
+
+    n: 회전수 [rpm], F: 이송 [mm/min], ap: 절입 깊이 [mm], flutes: 날 수 Z, ae: 절입 폭 [mm]
+    fz = F / (n·Z) [mm/날], A_chip = ap·fz [mm², 날 하나가 깎는 칩 단면적]
+    MRR = ap·ae·F [mm³/min]. ae를 모르면 ap·F [mm²/min]로 대신합니다.
+    """
+    try:
+        n, F, ap, flutes = (float(v) for v in (n, F, ap, flutes))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) and v > 0 for v in (n, F, ap, flutes)):
+        return None
+    try:
+        ae = float(ae)
+    except (TypeError, ValueError):
+        ae = math.nan
+    fz = F / (n * flutes)
+    return {'n': n, 'F': F, 'ap': ap, 'fz': fz, 'a_chip': ap * fz,
+            'mrr': ap * (ae if math.isfinite(ae) and ae > 0 else 1.0) * F}
+
+
 def feature_vector(feats, names=TIME_FEATURE_NAMES):
-    """LOF 입력 벡터 (크기 특징은 분포가 한쪽으로 길어 로그 변환)."""
-    return np.array([math.log(max(float(feats[name]), 1e-6)) for name in names])
+    """감지 모델 입력 벡터. 크기 특징은 분포가 한쪽으로 길어 로그 변환하고, 주파수 특징(0–1 비율)은 그대로 씁니다.
+    윈도우에 없는 특징(예: 고조파 마스크가 넓어 계산하지 않은 비고조파 비율)은 NaN입니다."""
+    values = []
+    for name in names:
+        value = feats.get(name)
+        if value is None:
+            values.append(np.nan)
+        elif name in SPECTRAL_FEATURE_NAMES:
+            values.append(float(value))
+        else:
+            values.append(math.log(max(float(value), 1e-6)))
+    return np.array(values)
 
 
 def session_windows(acc, t, config, spindle_rpm=None, active_only=True):

@@ -2,7 +2,10 @@
 
   python scripts/evaluate_detector.py              # data/dataset (데이터 수집 기록): 실행 단위 교차 검증
   python scripts/evaluate_detector.py --legacy     # data/학습 데이터 (예전 CSV): 파일 단위 교차 검증
-  python scripts/evaluate_detector.py --set k=3 --set self_ratio=2.5   # 판정 설정을 바꿔 비교
+  python scripts/evaluate_detector.py --set confirm_sec=0.5 --set self_ratio=2.5   # 판정 설정을 바꿔 비교
+  python scripts/evaluate_detector.py --set decision_mode=two_tier     # 2단계 판정(빠른 차단 + CUSUM)으로 평가
+  python scripts/evaluate_detector.py --legacy --set pca_variance=0.95 --set t2_alarm=true   # 감지 모델(PCA) 설정 비교
+  python scripts/evaluate_detector.py --condition-model models/condition_model.joblib   # 조건 모델(P09)을 넣어 평가
   python scripts/evaluate_detector.py --dataset data/synthetic/dataset --json result.json   # 결과를 JSON으로 저장
   python scripts/evaluate_detector.py --legacy --compare tests/baseline/v1.1_legacy.json   # 저장한 결과와 나란히 비교
 
@@ -11,10 +14,12 @@
   구간은 build_dataset.py의 labels.csv(라벨 시각 그대로)를 쓰고, 없으면 채터 윈도우를 이어 붙여 추정합니다.
   경보 시각은 경보를 낸 윈도우의 끝 시각이므로 지연은 윈도우 이동 간격 단위로 나옵니다.
 - 오경보: 채터 구간 근처(앞뒤 2초)가 아닌 곳의 경보 수, 안정 가공 1시간당 횟수
-- 실행 종류(run_type)별 집계, 경보 경로(판정 방식)별 감지·오경보 수
+- 실행 종류(run_type)별 집계, 경보 경로(판정 방식)별·경보 원인(경보 윈도우에서 가장 큰 증거 항목)별 감지·오경보 수
 창 설정(센서 샘플링: 1초 창·0.25초 간격 / 0.2초 창·0.05초 간격)이 다른 실행은 따로 교차 검증합니다.
-감지기는 실시간과 같은 코드(src/vibration_monitor.py의 fit_detector, DetectionCore)로 학습·판정합니다.
+감지기는 실시간과 같은 코드(src/vibration_monitor.py의 fit_detector, DetectionCore)로 학습·판정하고, 학습 윈도우는
+scripts/train_models.py가 감지 모델을 저장할 때와 같은 정상 윈도우입니다(normal_windows: 채터·전이 라벨 앞 3초 제외).
 평가하는 실행·파일은 학습에서 빼므로(교차 검증) 처음 보는 가공에서의 성능을 추정합니다.
+--set 값은 서버와 같은 규칙으로 검사합니다(vibration_monitor.setting_problem). 허용 범위 밖이면 평가하지 않습니다.
 """
 import argparse
 import glob
@@ -32,41 +37,41 @@ sys.path.insert(0, os.path.join(BASE_DIR, 'src'))
 
 import features  # noqa: E402
 import vibration_monitor as vm  # noqa: E402
+from train_models import LABEL_GUARD_SEC, label_starts, normal_windows, row_features  # noqa: E402
 
-SPECTRAL_KEYS = ('nonharmonic_ratio', 'peak_freq', 'peak_prominence', 'spectral_entropy')
 MATCH_BEFORE, MATCH_AFTER = 0.5, 1.0   # 채터 사례로 인정하는 경보 범위: 구간 시작 0.5초 전 ~ 끝 1초 뒤
 FA_MARGIN = 2.0                        # 채터 구간 앞뒤 이 시간 안의 경보는 오경보로 세지 않음
+BOOL_WORDS = {'1': True, 'true': True, 'yes': True, '0': False, 'false': False, 'no': False}
 
 
 def parse_overrides(items):
+    """--set KEY=VALUE 목록 → 판정 설정. 값의 형식은 기본값을 따르고, 서버와 같은 허용 범위로 검사합니다."""
     overrides = {}
     for item in items or []:
         key, _, value = item.partition('=')
         if key not in vm.DETECTION_DEFAULTS:
             sys.exit(f"알 수 없는 설정: {key} (가능: {', '.join(vm.DETECTION_DEFAULTS)})")
         default = vm.DETECTION_DEFAULTS[key]
-        if isinstance(default, bool):
-            overrides[key] = value.lower() in ('1', 'true', 'yes')
-        elif isinstance(default, int):
-            overrides[key] = int(value)
-        elif isinstance(default, float):
-            overrides[key] = float(value)
-        else:
-            overrides[key] = value
+        try:
+            if isinstance(default, bool):
+                parsed = BOOL_WORDS[value.lower()]
+            elif isinstance(default, int):
+                parsed = int(value)
+            elif isinstance(default, float):
+                parsed = float(value)
+            else:
+                parsed = value
+        except (KeyError, ValueError):
+            sys.exit(f"설정 값을 읽을 수 없습니다: {item}")
+        problem = vm.setting_problem(key, parsed)
+        if problem:
+            sys.exit(f"쓸 수 없는 설정 값입니다: {problem}")
+        overrides[key] = parsed
     return overrides
 
 
-def row_features(row):
-    feats = {name: float(row[name]) for name in features.TIME_FEATURE_NAMES + ['rms']}
-    feats['spectral'] = bool(row.get('spectral')) and str(row.get('spectral')).lower() not in ('false', '0', 'nan')
-    for key in SPECTRAL_KEYS:
-        value = row.get(key)
-        feats[key] = None if value is None or pd.isna(value) else float(value)
-    return feats
-
-
 def simulate_run(core, run_rows):
-    """실행 하나를 시간 순서대로 판정 → [(경보 시작 시각, 경보 경로, 실행 시작부터 초)]
+    """실행 하나를 시간 순서대로 판정 → [(경보 시작 시각, 경보 경로, 실행 시작부터 초, 가장 큰 증거 항목)]
     실시간(VibrationMonitor._gate)과 같이 판정 구간 안에서 회전수·이송이 바뀌면 core.condition_changed()를 부릅니다."""
     alarms = []
     in_cut, last_condition = False, None
@@ -85,10 +90,11 @@ def simulate_run(core, run_rows):
         last_condition = condition
         if row['transient']:
             continue
-        cond = {'n': row['n'], 'F': row['F'], 'ap': row['ap']}
+        cond = {'n': row['n'], 'F': row['F'], 'ap': row['ap'], 'flutes': row.get('flutes'), 'ae': row.get('ae')}
         step = core.step(row_features(row), cond)
         if step['decision'] == 'start':
-            alarms.append((row['t_host'], step.get('trip') or core.config['decision_mode'], row.get('t_rel')))
+            alarms.append((row['t_host'], step.get('trip') or core.config['decision_mode'], row.get('t_rel'),
+                           max(step['parts'], key=step['parts'].get)))
     return alarms
 
 
@@ -150,8 +156,9 @@ class Tally:
         }
 
 
-def score_run(rows, alarms, events, tallies, trips):
-    """한 실행의 경보를 채터 사례와 맞춰 tallies에 더합니다. 반환: 감지한 사례의 지연 목록"""
+def score_run(rows, alarms, events, tallies, trips, causes=None):
+    """한 실행의 경보를 채터 사례와 맞춰 tallies에 더합니다. 반환: 감지한 사례의 지연 목록
+    trips·causes: 경보 경로별·증거 항목별 감지·오경보 수 (causes는 경보 튜플의 네 번째 값, 없으면 세지 않음)"""
     matched, latencies = set(), []
     stable_seconds = ((rows['gate'] == 1) & (rows['label'] == 'stable')).sum() * run_hop(rows)
     for tally in tallies:
@@ -165,6 +172,8 @@ def score_run(rows, alarms, events, tallies, trips):
         latencies.append(hits[0][0] - start)
         matched.update(hits)
         trips[hits[0][1]]['detections'] += 1
+        if causes is not None:
+            causes[hits[0][3]]['detections'] += 1
         for tally in tallies:
             tally.detected += 1
             tally.latencies.append(latencies[-1])
@@ -172,12 +181,15 @@ def score_run(rows, alarms, events, tallies, trips):
         if alarm in matched or any(start - FA_MARGIN <= alarm[0] <= end + FA_MARGIN for start, end in events):
             continue
         trips[alarm[1]]['false_alarms'] += 1
+        if causes is not None:
+            causes[alarm[3]]['false_alarms'] += 1
         for tally in tallies:
             tally.false_alarms += 1
     return latencies
 
 
-def evaluate_dataset(dataset_dir, config):
+def evaluate_dataset(dataset_dir, config, condition_model=None):
+    """condition_model: 조건 모델(vm.load_condition_model). 평가하는 실행과 다른 데이터(예: grid 시험)로 학습한 것을 씁니다."""
     path = os.path.join(dataset_dir, 'windows.csv')
     if not os.path.exists(path):
         sys.exit(f"{path}가 없습니다. 먼저 python scripts/build_dataset.py를 실행하세요.")
@@ -185,9 +197,14 @@ def evaluate_dataset(dataset_dir, config):
     if 'profile' not in df.columns:  # P04 이전 데이터셋은 모두 1초 창
         df['profile'] = 'legacy'
     full = dict(vm.DETECTION_DEFAULTS, **config)
+    # 학습 윈도우: train_models가 감지 모델을 저장할 때와 같은 정상 윈도우 (늦은 라벨 앞 LABEL_GUARD_SEC 제외)
+    normal = normal_windows(df, label_starts(dataset_dir, df))
+    guarded = int(((df['gate'] == 1) & (df['transient'] == 0) & (df['label'] == 'stable')).sum()) - len(normal)
+    print(f"  정상 학습 윈도우 {len(normal)}개 (채터·전이 라벨 시작 앞 {LABEL_GUARD_SEC:g}초 안의 {guarded}개 뺌)")
     label_events = load_label_events(dataset_dir)
     overall, by_type = Tally(), defaultdict(Tally)
     trips = defaultdict(lambda: {'detections': 0, 'false_alarms': 0})
+    causes = defaultdict(lambda: {'detections': 0, 'false_alarms': 0})
     used_profiles = {}
     # 창 설정마다 따로 교차 검증합니다 (모델은 같은 창 설정의 윈도우로만 학습하므로)
     for profile in sorted(df['profile'].unique()):
@@ -205,23 +222,22 @@ def evaluate_dataset(dataset_dir, config):
             train_runs, test_runs = set(run_ids[train_idx]), set(run_ids[test_idx])
             sessions = []
             for run_id in sorted(train_runs):
-                stable = part[(part['run_id'] == run_id) & (part['gate'] == 1) & (part['transient'] == 0)
-                              & (part['label'] == 'stable')]
+                stable = normal[(normal['profile'] == profile) & (normal['run_id'] == run_id)]
                 sessions.append([row_features(row) for _, row in stable.iterrows()])
             try:
                 model = vm.fit_detector(sessions, config, profile)
             except ValueError as e:
                 print(f"  fold {fold}: 학습 실패 ({e})")
                 continue
-            core = vm.DetectionCore(model, full)
+            core = vm.DetectionCore(model, full, condition_model)
             for run_id in sorted(test_runs):
                 rows = part[part['run_id'] == run_id]
                 alarms = simulate_run(core, rows)
                 events = label_events.get(run_id, []) if label_events is not None else chatter_events(rows, window_sec)
                 run_type = rows['run_type'].iloc[0] if 'run_type' in rows.columns else None
                 run_type = str(run_type) if run_type is not None and pd.notna(run_type) and str(run_type) else '(없음)'
-                latencies = score_run(rows, alarms, events, (overall, by_type[run_type]), trips)
-                when = (" (" + ", ".join(_seconds(a[2]) for a in alarms) + "초)") if alarms else ""
+                latencies = score_run(rows, alarms, events, (overall, by_type[run_type]), trips, causes)
+                when = (" (" + ", ".join(f"{_seconds(a[2])}초 {a[3]}" for a in alarms) + ")") if alarms else ""
                 delay = (", 지연 " + ", ".join(f"{x:.2f}" for x in latencies) + "초") if latencies else ""
                 print(f"  {run_id}: 채터 사례 {len(events)}개, 경보 {len(alarms)}회{when}{delay}")
     if not used_profiles:
@@ -229,9 +245,13 @@ def evaluate_dataset(dataset_dir, config):
     result = {
         'mode': 'dataset', 'dataset': _display_path(dataset_dir),
         'events_source': 'labels' if label_events is not None else 'windows',
+        'label_guard_sec': LABEL_GUARD_SEC, 'guarded_windows': guarded,
         'config': full, 'window_profiles': used_profiles,
         'overall': overall.summary(), 'by_type': {k: v.summary() for k, v in sorted(by_type.items())},
-        'by_trip': {k: v for k, v in sorted(trips.items())}, 'latencies_s': [_round(x) for x in overall.latencies],
+        'by_trip': {k: v for k, v in sorted(trips.items())}, 'by_cause': {k: v for k, v in sorted(causes.items())},
+        'latencies_s': [_round(x) for x in overall.latencies],
+        'condition_model': None if condition_model is None else {
+            key: condition_model.get(key) for key in ('features', 'n_runs', 'n_rows', 'log_margin', 'coverage', 'trained_at')},
     }
     print_dataset_summary(result)
     return result
@@ -249,13 +269,14 @@ def evaluate_legacy(config):
     profiles = {f: features.window_profile(data[f]['fs'], base) for f in files}  # 파일마다 샘플링으로 창 설정
 
     def run(models, f):
-        """파일 f를 그 창 설정의 모델로 판정 → (경보 수, 가공 윈도우 수, 평가 간격). 그 설정의 모델이 없으면 None"""
+        """파일 f를 그 창 설정의 모델로 판정 → (경보마다 가장 큰 증거 항목, 가공 윈도우 수, 평가 간격).
+        그 설정의 모델이 없으면 None"""
         model = models.get(profiles[f])
         if model is None:
             return None
         fc = model['feature_config']
         core = vm.DetectionCore(model, full)
-        alarms, active = 0, 0
+        alarms, active = [], 0
         for acc, t in data[f]['segments']:
             core.new_cut()
             for _, feats in features.session_windows(acc, t, fc, active_only=False):
@@ -263,20 +284,27 @@ def evaluate_legacy(config):
                     core.new_cut()
                     continue
                 active += 1
-                alarms += core.step(feats)['decision'] == 'start'
+                step = core.step(feats)
+                if step['decision'] == 'start':
+                    alarms.append(max(step['parts'], key=step['parts'].get))
         return alarms, active, fc['hop_sec']
 
-    false_alarms, seconds, per_file = 0, 0.0, {}
+    def counted(alarms):
+        return {cause: alarms.count(cause) for cause in sorted(set(alarms))}
+
+    false_alarms, seconds, per_file, causes = 0, 0.0, {}, []
     for f in normal:
         result = run(vm.train_detectors([data[g] for g in normal if g != f], full), f)
         if result is None:
             print(f"  정상 {os.path.basename(f)}: 같은 창 설정의 다른 학습 파일이 없어 건너뜀")
             continue
         alarms, active, hop = result
-        false_alarms += alarms
+        false_alarms += len(alarms)
+        causes += alarms
         seconds += active * hop
-        per_file[os.path.basename(f)] = alarms
-        print(f"  정상 {os.path.basename(f)}: 가공 윈도우 {active}개, 경보 {alarms}회")
+        per_file[os.path.basename(f)] = len(alarms)
+        print(f"  정상 {os.path.basename(f)}: 가공 윈도우 {active}개, 경보 {len(alarms)}회"
+              + (f" ({', '.join(alarms)})" if alarms else ""))
     models = vm.train_detectors([data[f] for f in normal], full)
     abnormal_result = {}
     for f in abnormal:
@@ -285,8 +313,9 @@ def evaluate_legacy(config):
             print(f"  이상 {os.path.basename(f)}: 같은 창 설정의 학습 파일이 없어 건너뜀")
             continue
         alarms, active, _ = result
-        abnormal_result[os.path.basename(f)] = {'alarms': alarms, 'windows': active}
-        print(f"  이상 {os.path.basename(f)}: 가공 윈도우 {active}개, 경보 {alarms}회")
+        abnormal_result[os.path.basename(f)] = {'alarms': len(alarms), 'windows': active, 'causes': counted(alarms)}
+        print(f"  이상 {os.path.basename(f)}: 가공 윈도우 {active}개, 경보 {len(alarms)}회"
+              + (f" ({', '.join(alarms)})" if alarms else ""))
     per_hour = false_alarms / max(seconds / 3600, 1e-9)
     print(f"정상 오경보: {false_alarms}회 / 가공 {seconds / 60:.1f}분 ({per_hour:.0f}회/시간)")
     print("주의: 예전 데이터는 이상 파일이 1개뿐이고 시각·조건 기록이 없어 참고용입니다.")
@@ -294,7 +323,7 @@ def evaluate_legacy(config):
         'mode': 'legacy', 'config': full,
         'window_profiles': {p: dict(features.WINDOW_PROFILES[p]) for p in sorted(set(profiles.values()))},
         'normal': {'files': len(normal), 'false_alarms': false_alarms, 'cut_minutes': round(seconds / 60, 2),
-                   'false_alarms_per_hour': round(per_hour, 2), 'per_file': per_file},
+                   'false_alarms_per_hour': round(per_hour, 2), 'per_file': per_file, 'causes': counted(causes)},
         'abnormal': abnormal_result,
     }
 
@@ -330,9 +359,10 @@ def print_dataset_summary(result):
     source = '라벨 구간 시각' if result['events_source'] == 'labels' else '채터 윈도우로 추정한 구간'
     print(f"\n결과 (채터 사례 기준: {source})")
     print_tally(result['overall'])
-    if result['by_trip']:
-        print("  경보 경로: " + ", ".join(f"{name} 감지 {v['detections']}회·오경보 {v['false_alarms']}회"
-                                       for name, v in result['by_trip'].items()))
+    for key, title in (('by_trip', '경보 경로'), ('by_cause', '경보 원인(가장 큰 증거 항목)')):
+        if result.get(key):
+            print(f"  {title}: " + ", ".join(f"{name} 감지 {v['detections']}회·오경보 {v['false_alarms']}회"
+                                           for name, v in result[key].items()))
     if len(result['by_type']) > 1:
         print("\n실행 종류별 (사례·감지·지연 중앙값/최대·오경보·안정 가공 분)")
         for name, s in result['by_type'].items():
@@ -392,10 +422,20 @@ def main():
     parser.add_argument('--set', action='append', metavar='KEY=VALUE', help="판정 설정 변경 (여러 번 사용 가능)")
     parser.add_argument('--json', metavar='PATH', help="결과를 JSON 파일로 저장")
     parser.add_argument('--compare', metavar='PATH', help="저장해 둔 결과(JSON)와 나란히 비교")
+    parser.add_argument('--condition-model', metavar='PATH',
+                        help="조건 모델(scripts/train_models.py)을 넣어 평가 (평가하는 실행과 다른 데이터로 학습한 것)")
     args = parser.parse_args()
     config = parse_overrides(args.set)
+    condition_model = None
+    if args.condition_model:
+        condition_model = vm.load_condition_model(args.condition_model)
+        if condition_model is None:
+            sys.exit(f"조건 모델을 읽을 수 없습니다: {args.condition_model} (scripts/train_models.py로 학습한 파일인지 확인하세요)")
+        coverage = condition_model.get('coverage')
+        print(f"조건 모델: {args.condition_model} (실행 {condition_model['n_runs']}개로 학습"
+              + (f", 상한 포함률 {coverage:.1%}" if coverage is not None else "") + ")")
     print(f"판정 설정: {dict(vm.DETECTION_DEFAULTS, **config)}")
-    result = evaluate_legacy(config) if args.legacy else evaluate_dataset(args.dataset, config)
+    result = evaluate_legacy(config) if args.legacy else evaluate_dataset(args.dataset, config, condition_model)
     if args.json:
         os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
         with open(args.json, 'w', encoding='utf-8') as f:

@@ -5,6 +5,7 @@ Runs on a throw-away copy of the project made by run_tests.py, so nc/rework.nc, 
   python tests/run_tests.py e2e
 Fixtures used from the copy: nc/O0527.txt, nc/O0807.txt, nc/O1001.nc, data/학습 데이터/*.csv, data/Vibration_detection.csv
 """
+import contextlib
 import csv
 import glob
 import io
@@ -182,10 +183,12 @@ def poke_during_job():
     t0 = time.time()
     emit("grbl_command", {"command": "G91"})
     check("raw GRBL console command rejected while machining", any("직접 보낼 수 없습니다" in m for m in logs_since(t0)))
+    sim.drop_override_bytes = 1  # the first of the three feed -10 commands is lost
     r3 = emit("set_feed_override", {"value": 70})
     wait_for(lambda: sim.feed_ov == 70, 2)
-    check("feed override 70% applied via realtime bytes (apply_override existed? now yes)", r3["status"] == "success" and sim.feed_ov == 70,
-          f"sim feed_ov={sim.feed_ov}")
+    check("feed override 70%: the lost command shows in the status report (Ov:80) and only the rest is sent again (P07)",
+          r3["status"] == "success" and sim.feed_ov == 70 and r3.get("confirmed") and r3.get("retries") == 1,
+          f"sim feed_ov={sim.feed_ov}, {r3.get('message')}")
     check("spindle override -10% x3 used 0x9B", sim.spindle_ov == 70, f"sim spindle_ov={sim.spindle_ov}")
 
 
@@ -311,8 +314,14 @@ time.sleep(0.5)
 check("machine does not move after the stop", sim.mpos == pos_after)
 with open(os.path.join(COPY, "data", "Vibration_detection.csv"), encoding="utf-8", newline="") as f:
     det_rows = list(csv.reader(f))
-check("Vibration_detection.csv: 11 columns, earlier records kept, new 'stop' record appended",
-      det_rows[0] == vibration_monitor.DETECTION_LOG_HEADER and det_rows[:len(INITIAL_DETECTION_ROWS)] == INITIAL_DETECTION_ROWS
+expected_initial = INITIAL_DETECTION_ROWS
+if INITIAL_DETECTION_ROWS and INITIAL_DETECTION_ROWS[0] != vibration_monitor.DETECTION_LOG_HEADER:  # written before Cause/Trip existed
+    old_columns = {name: i for i, name in enumerate(INITIAL_DETECTION_ROWS[0])}
+    expected_initial = [vibration_monitor.DETECTION_LOG_HEADER] + [
+        [r[old_columns[name]] if name in old_columns else "" for name in vibration_monitor.DETECTION_LOG_HEADER]
+        for r in INITIAL_DETECTION_ROWS[1:] if r]
+check("Vibration_detection.csv: current header (an older file gets empty Cause/Trip columns), earlier records kept, "
+      "new 'stop' record appended", det_rows[0] == vibration_monitor.DETECTION_LOG_HEADER and det_rows[:len(expected_initial)] == expected_initial
       and det_rows[-1][-1] == "stop" and float(det_rows[-1][2]) > 3 and det_rows[-1][4] != "", str(det_rows[-1]))
 created = wait_for(lambda: os.path.getmtime(rework_path) > mtime_before, 30)
 msgs = logs_since(t0)
@@ -391,6 +400,16 @@ check("alarm -> online mitigation, machine keeps cutting",
       f"event={monitor.event and monitor.event.get('stage')} state={cnc_app.state} evidence={monitor.latest.get('evidence')}")
 check("overrides applied: spindle +10% (110%), feed -20% (80%)",
       wait_for(lambda: sim.spindle_ov == 110 and sim.feed_ov == 80, 5), f"spindle_ov={sim.spindle_ov} feed_ov={sim.feed_ov}")
+ov_sent = [(t, b) for t, b in zip(sim.realtime_times, sim.realtime_log) if t >= t0 and 0x90 <= b <= 0x9D]
+check("P07: only the needed commands (feed -10 twice, spindle +10, no reset), feed first, all sent within 50 ms",
+      [b for _, b in ov_sent] == [0x92, 0x9A, 0x92] and ov_sent[-1][0] - ov_sent[0][0] < 0.05,
+      str([(round(t - ov_sent[0][0], 3), hex(b)) for t, b in ov_sent]))
+wait_for(lambda: (monitor.last_override or {}).get('confirmed_at'), 3)
+timing = monitor.last_override or {}
+check("P07: reflection confirmed from the status report (Ov:); detection -> send -> confirm times kept and logged",
+      timing.get('confirmed_at') and 0 <= timing['sent_at'] - timing['detected_at'] < 0.1
+      and 0 < timing['confirmed_at'] - timing['sent_at'] < 0.5 and any("오버라이드 반영 확인" in m for m in logs_since(t0)),
+      str({k: v for k, v in timing.items() if k != 'values'}))
 feeder.run(3.0)
 msgs = logs_since(t0)
 check("vibration settles -> mitigation succeeds, job continues", any("안정되어" in m for m in msgs) and cnc_app.job_active
@@ -421,6 +440,70 @@ sim.time_scale = 20.0
 wait_for(lambda: not cnc_app.job_active, 60)
 check("rework after escalation finished", cnc_app.state in ("idle", "alarm_unlocked") and not sim.alarm, cnc_app.state)
 
+print("== stability limit model (P11): online speed change and rework conditions from the model ==")
+sys.path.append(os.path.join(COPY, "scripts"))
+import optimizer  # noqa: E402
+import train_models  # noqa: E402
+
+sld_dir = os.path.join(COPY, "data", "sld_e2e")
+os.makedirs(sld_dir, exist_ok=True)
+sld_speeds = list(range(16000, 24001, 500))  # deep trough around the long cut's 20000 rpm, stable lobe from 22000 rpm
+sld_limits = [0.30, 0.30, 0.28, 0.24, 0.16, 0.10, 0.08, 0.08, 0.08, 0.08, 0.08, 0.12, 0.25, 0.40, 0.48, 0.50, 0.50]
+pd.DataFrame({"run_id": [f"R{s}" for s in sld_speeds], "n": sld_speeds, "F": 100.0, "onset_ap": sld_limits, "max_ap": 0.55,
+              "censored": 0, "flutes": 2, "tool_id": "T1"}).to_csv(os.path.join(sld_dir, "ramp_limits.csv"), index=False,
+                                                                   encoding="utf-8-sig")
+sld_model = os.path.join(COPY, "models", "sld_e2e.joblib")
+with contextlib.redirect_stdout(io.StringIO()):
+    train_models.train_sld(sld_dir, sld_model)
+suggestions = []
+
+
+class RecordingOptimizer(optimizer.CuttingConditionOptimizer):
+    def suggest(self, *args, **kwargs):
+        result = super().suggest(*args, **kwargs)
+        suggestions.append((kwargs.get("purpose"), result))
+        return result
+
+
+default_optimizer, flutes_before = monitor.optimizer, cnc_app.tool_flutes
+monitor.optimizer = RecordingOptimizer(model_path=sld_model)
+monitor.last_override = None
+cnc_app.tool_flutes = 2
+sim.time_scale = 1.0
+wait_for(lambda: cnc_app.state in ("idle", "alarm_unlocked"), 10)
+mtime_before = os.path.getmtime(rework_path)
+check("cut started (2-flute tool, stability limit model loaded)", start_long_cut() and monitor.optimizer.sld is not None)
+feeder.run(3.0)
+t0 = time.time()
+feeder.run(7.0, scale=3.0)
+stopped = wait_for(lambda: cnc_app.state == "emergency" and not cnc_app.job_active, 10)
+online = next((r for purpose, r in suggestions if purpose == "online"), None)
+applied = (monitor.last_override or {}).get("values") or {}
+check("online: speed from the model (nearest speed whose safe depth covers 0.2 mm), feed kept at 100% "
+      "(the default rule would cut it to 80%)", online is not None and online["method"] == "sld" and online["n"] != 20000
+      and applied == {"feed": 100, "spindle": int(round(100 * online["n"] / 20000))}
+      and any("온라인 대응:" in m and "안정 한계 모델" in m for m in logs_since(t0)), f"{online} {applied}")
+created = wait_for(lambda: os.path.getmtime(rework_path) > mtime_before, 30)
+rework_pick = next((r for purpose, r in suggestions if purpose == "rework"), None)
+msgs = logs_since(t0)
+check("rework conditions from the model: fewest passes (at least 2) at the nearest such speed, feed not raised",
+      stopped and created and rework_pick is not None and rework_pick["method"] == "sld" and rework_pick["passes"] >= 2
+      and rework_pick["F"] <= 100 and any("재가공 조건" in m and "안정 한계 모델" in m for m in msgs),
+      next((m for m in msgs if "재가공 조건" in m), "no rework message"))
+wait_for(lambda: cnc_app.job_active, 15)
+sim.time_scale = 20.0
+wait_for(lambda: not cnc_app.job_active, 60)
+with open(rework_path, encoding="utf-8") as f:
+    rlines = [l.strip() for l in f if l.strip()]
+speed_text = f"S{rework_pick['n']:.0f}" if rework_pick else "?"
+check("rework.nc carries the model's speed and pass count (depth -0.1 -> -0.2, tolerance pass -0.4) and ran to the end",
+      rework_pick is not None and rlines[0].startswith(f"(rework sld: {speed_text} F")
+      and f"depth passes {rework_pick['passes']}" in rlines[0]
+      and all(speed_text in l for l in rlines if l.startswith("M3 ")) and any(l.startswith("M3 ") for l in rlines)
+      and any(l.startswith("G1 Z-0.100") for l in rlines) and any(l.startswith("G1 Z-0.400") for l in rlines)
+      and cnc_app.state in ("idle", "alarm_unlocked") and not sim.alarm, str(rlines[:4]))
+monitor.optimizer, cnc_app.tool_flutes = default_optimizer, flutes_before
+
 print("== detector settings API (온라인 대응·판정 방식) ==")
 r = http.post("/api/vibration/settings", json={'mitigation_enabled': False}).get_json()
 check("mitigation can be switched off and is saved", r["status"] == "success" and r["model"]["settings"]["mitigation_enabled"] is False
@@ -429,7 +512,20 @@ r = http.post("/api/vibration/settings", json={'decision_mode': 'bogus'}).get_js
 check("invalid decision mode rejected", r["status"] == "error", r["message"])
 r = http.post("/api/vibration/settings", json={'mitigation_enabled': True, 'decision_mode': 'cusum'}).get_json()
 check("cusum mode accepted", r["status"] == "success" and monitor.config['decision_mode'] == 'cusum')
-http.post("/api/vibration/settings", json={'decision_mode': 'k_of_n'})
+r = http.post("/api/vibration/settings", json={'decision_mode': 'two_tier', 'shadow_two_tier': False}).get_json()
+with open(os.path.join(COPY, "data", "detector_settings.json"), encoding="utf-8") as f:
+    saved_settings = json.load(f)
+check("two-tier decision and the record-only switch accepted and saved", r["status"] == "success"
+      and monitor.config['decision_mode'] == 'two_tier' and monitor.config['shadow_two_tier'] is False
+      and saved_settings.get('decision_mode') == 'two_tier' and saved_settings.get('shadow_two_tier') is False, r["message"])
+r = http.post("/api/vibration/settings", json={'shadow_two_tier': 'yes'}).get_json()
+check("record-only switch must be true/false", r["status"] == "error", r["message"])
+r = http.post("/api/vibration/settings", json={'t2_alarm': True}).get_json()
+r_bad = http.post("/api/vibration/settings", json={'t2_alarm': 1}).get_json()
+check("T² (outside the training range) can be added to the alarm parts; value must be true/false",
+      r["status"] == "success" and monitor.config['t2_alarm'] is True and r["model"]["settings"]["t2_alarm"] is True
+      and r_bad["status"] == "error", r_bad["message"])
+http.post("/api/vibration/settings", json={'decision_mode': 'k_of_n', 'shadow_two_tier': True, 't2_alarm': False})
 
 
 class FakeFastSensor:
@@ -540,6 +636,20 @@ with open(legacy, encoding="utf-8", newline="") as f:
     rows = list(csv.reader(f))
 check("legacy text moved to .old, new file has header + 1 row (unknown RPM/F left empty)",
       os.path.isfile(legacy + ".old") and len(rows) == 2 and rows[1][1:8] == ["1.000", "2.000", "3.000", "", "", "100", "100"], str(rows))
+with_trip = os.path.join(COPY, "data", "trip_detection.csv")  # Trip column but no Cause column yet
+p06_header = [h for h in vibration_monitor.DETECTION_LOG_HEADER if h != "Cause"]
+with open(with_trip, "w", encoding="utf-8", newline="") as f:
+    csv.writer(f).writerows([p06_header, ["2026-10-31 10:00:00", "1.000", "2.000", "-0.300", "20000", "100.0", "100", "100", "1.50",
+                                          "437", "fast", "shadow"]])
+vibration_monitor.append_detection_record((1, 2, 3), 20000.0, 100.0, 100, 100, 2.0, None, "stop", path=with_trip,
+                                          trip="k_of_n", cause="spe: kurt_z 46%, rms_z 21%")
+with open(with_trip, encoding="utf-8", newline="") as f:
+    lines = list(csv.reader(f))
+rows = [dict(zip(lines[0], r)) for r in lines[1:]]
+check("a log with Trip but without Cause gets an empty Cause column in place (no .old); new rows carry the cause",
+      lines[0] == vibration_monitor.DETECTION_LOG_HEADER and not os.path.exists(with_trip + ".old") and len(rows) == 2
+      and rows[0]["Cause"] == "" and rows[0]["Trip"] == "fast"
+      and rows[0]["ChatterHz"] == "437" and rows[1]["Cause"] == "spe: kurt_z 46%, rms_z 21%" and rows[1]["Action"] == "stop", str(rows))
 
 print("== vibration model management API (진동 감지 모델 창) ==")
 train_dir = os.path.join(COPY, "data", "학습 데이터")
@@ -548,8 +658,14 @@ model = resp.get("model", {})
 n_files = len(model.get("files", []))
 check("status: trained on the normal files only", resp["status"] == "success" and model["is_trained"] and n_files == N_NORMAL_FILES
       and not any("이상" in name for name in model["files"]) and model["windows"] > 0 and model["thresholds"]["rms_g"] > 0
-      and model["thresholds"]["calibration"] == "session_holdout",
+      and model["thresholds"]["calibration"] == "session_holdout" and model["thresholds"]["spe"] > 0 and model["thresholds"]["t2"] > 0
+      and len(model["thresholds"]["features"]) == 9 and 1 <= model["thresholds"]["components"] <= 7,
       str({k: v for k, v in model.items() if k != "files"}))
+check("status (P12): each window setting's model names its source; no dataset model in this copy; judged windows give the "
+      "outside-the-training-range share; notes list mismatched settings",
+      model["profiles"]["legacy"]["source"] == "folder" and model["detector_model"] is None and isinstance(model["notes"], list)
+      and model["t2_recent"] is not None and 0.0 <= model["t2_recent"]["fraction"] <= 1.0 and "release_level" in model["settings"],
+      str({k: model.get(k) for k in ("profiles", "detector_model", "t2_recent", "notes")}))
 with open(sorted(glob.glob(os.path.join(train_dir, "*.csv")))[2], "rb") as f:
     sample_bytes = f.read()
 
